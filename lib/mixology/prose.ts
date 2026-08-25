@@ -156,8 +156,12 @@ export function extractMixTicket(raw: string): { text: string; ticketRaw?: strin
     return { text: result.text, ticketRaw: result.ticketRaw };
 }
 
-// 强调认全半角波浪号（模型两种都写）；对白/心声先整段匹配，强调再进去嵌套解析
-const INLINE_RE = /「([^」]*)」|\*([^*\n]+)\*|[~～]([^~～\n]+)[~～]/g;
+// 强调认全半角波浪号（模型两种都写）；对白同理兼容双引号——模型在长篇里经常
+// 滑回 “” / ""，认下来照样当对白渲染。只认这一层：存储一个字不改，正文永远是
+// 模型写的原样，回传给模型的历史也照旧。只吃单行、非空、不过长的一段，
+// 免得把跨段落的引号并成一大坨。
+// 对白/心声先整段匹配，强调再进去嵌套解析
+const INLINE_RE = /「([^」]*)」|[“"]([^”"\n]{1,200})[”"]|\*([^*\n]+)\*|[~～]([^~～\n]+)[~～]/g;
 const ACCENT_RE = /[~～]([^~～\n]+)[~～]/g;
 
 /** 把一段文字按 ~强调~ 拆成子段；没有强调返回 undefined（走整段渲染的旧路） */
@@ -184,9 +188,11 @@ function parseInline(line: string): MixProseSegment[] {
         if (match.index > cursor) {
             segments.push({ type: "narration", text: line.slice(cursor, match.index) });
         }
-        if (match[1] !== undefined) segments.push({ type: "dialogue", text: `「${match[1]}」`, inner: parseAccentRuns(match[1]) });
-        else if (match[2] !== undefined) segments.push({ type: "thought", text: match[2], inner: parseAccentRuns(match[2]) });
-        else segments.push({ type: "accent", text: match[3] });
+        // 「」与双引号都是对白，一律按「」渲染，看不出模型当时掉没掉格式
+        const said = match[1] ?? match[2];
+        if (said !== undefined) segments.push({ type: "dialogue", text: `「${said}」`, inner: parseAccentRuns(said) });
+        else if (match[3] !== undefined) segments.push({ type: "thought", text: match[3], inner: parseAccentRuns(match[3]) });
+        else segments.push({ type: "accent", text: match[4] });
         cursor = match.index + match[0].length;
     }
     if (cursor < line.length) {
