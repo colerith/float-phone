@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ProxyAgent, type Dispatcher } from "undici";
+import JSZip from "jszip";
 
 export const maxDuration = 120;
 
 type ImageGenerationRequest = {
+  provider?: "openai" | "novelai";
   apiKey?: string;
   baseUrl?: string;
   model?: string;
@@ -11,6 +13,15 @@ type ImageGenerationRequest = {
   size?: string;
   quality?: string;
   referenceImageDataUrl?: string;
+  // NovelAI 专属参数
+  negativePrompt?: string;
+  steps?: number;
+  scale?: number;
+  sampler?: string;
+  noiseSchedule?: string;
+  qualityToggle?: boolean;
+  smea?: boolean;
+  smeaDyn?: boolean;
 };
 
 type ExtractedImage =
@@ -117,7 +128,116 @@ async function fetchImageUrl(url: string): Promise<{ b64: string; mimeType: stri
   return { b64: buffer.toString("base64"), mimeType };
 }
 
+async function runNovelAiGeneration(input: ImageGenerationRequest): Promise<{ status: number; body: Record<string, unknown> }> {
+  try {
+    const apiKey = input.apiKey?.trim();
+    const model = input.model?.trim() || "nai-diffusion-4-curated-preview";
+    const prompt = input.prompt?.trim();
+
+    if (!apiKey) return { status: 400, body: { error: "缺少 NovelAI API Token" } };
+    if (!prompt) return { status: 400, body: { error: "缺少提示词" } };
+
+    // 解析尺寸，默认 832x1216
+    let width = 832;
+    let height = 1216;
+    if (input.size && input.size.includes("x")) {
+      const [wStr, hStr] = input.size.split("x");
+      const w = parseInt(wStr, 10);
+      const h = parseInt(hStr, 10);
+      if (!isNaN(w) && !isNaN(h) && w > 0 && h > 0) {
+        width = w;
+        height = h;
+      }
+    }
+
+    const url = "https://image.novelai.net/ai/generate-image";
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      Origin: "https://novelai.net",
+      Referer: "https://novelai.net/",
+    };
+
+    const parameters: Record<string, unknown> = {
+      width,
+      height,
+      scale: typeof input.scale === "number" ? input.scale : 6.0,
+      sampler: input.sampler || "k_euler",
+      steps: typeof input.steps === "number" ? input.steps : 28,
+      n_samples: 1,
+      ucPreset: 0,
+      qualityToggle: input.qualityToggle !== false,
+      sm: input.smea === true,
+      sm_dyn: input.smeaDyn === true,
+      dynamic_thresholding: false,
+      controlnet_strength: 1,
+      legacy: false,
+      add_original_image: false,
+      uncond_scale: 1,
+      cfg_rescale: 0,
+      noise_schedule: input.noiseSchedule || "karras",
+      negative_prompt: input.negativePrompt || "",
+    };
+
+    const body = JSON.stringify({
+      input: prompt,
+      model,
+      action: "generate",
+      parameters,
+    });
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120_000);
+    let res: Response;
+    try {
+      res = await externalFetch(url, { method: "POST", headers, body, signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      return { status: 502, body: { error: `NovelAI 生图失败 ${res.status}: ${errText.slice(0, 600)}` } };
+    }
+
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    const buffer = Buffer.from(await res.arrayBuffer());
+
+    // NovelAI 原生返回的是 zip 压缩包（内含 png）
+    if (contentType.includes("zip") || buffer.slice(0, 4).toString("hex") === "504b0304") {
+      const zip = await JSZip.loadAsync(buffer);
+      const files = Object.keys(zip.files);
+      const pngFilename = files.find(f => f.endsWith(".png")) || files[0];
+      if (!pngFilename) {
+        return { status: 502, body: { error: "NovelAI 返回的 ZIP 压缩包内未找到图片文件" } };
+      }
+      const imageBuffer = await zip.files[pngFilename].async("nodebuffer");
+      return {
+        status: 200,
+        body: {
+          b64: imageBuffer.toString("base64"),
+          mimeType: "image/png",
+        },
+      };
+    }
+
+    if (contentType.startsWith("image/")) {
+      return { status: 200, body: { b64: buffer.toString("base64"), mimeType: contentType } };
+    }
+
+    return { status: 502, body: { error: `NovelAI 返回了未知格式的响应 (${contentType || "unknown"})` } };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const status = message.toLowerCase().includes("abort") ? 504 : 502;
+    return { status, body: { error: message } };
+  }
+}
+
 async function runImageGeneration(input: ImageGenerationRequest): Promise<{ status: number; body: Record<string, unknown> }> {
+  if (input.provider === "novelai") {
+    return runNovelAiGeneration(input);
+  }
+
   try {
     const apiKey = input.apiKey?.trim();
     const baseUrl = input.baseUrl?.trim();
