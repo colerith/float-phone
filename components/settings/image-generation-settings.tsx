@@ -14,6 +14,7 @@ import type { Character } from "@/lib/character-types";
 import { getChatImageFromIndexedDB, saveChatImageToIndexedDB } from "@/lib/chat-asset-storage";
 import {
     fetchImageGenerationModels,
+    fetchNovelAiModels,
     filterLikelyImageModels,
     generateImageFromConfiguredApi,
 } from "@/lib/image-generation-service";
@@ -23,11 +24,11 @@ import { Input, Select, Textarea, Toggle } from "@/components/ui/form";
 const SIZE_OPTIONS = ["auto", "1024x1024", "1024x1536", "1536x1024"];
 const QUALITY_OPTIONS = ["auto", "low", "medium", "high"];
 
-const NAI_MODEL_OPTIONS = [
-    { value: "nai-diffusion-4-curated-preview", label: "NAI Diffusion V4 (Curated Preview)" },
-    { value: "nai-diffusion-4-full", label: "NAI Diffusion V4 (Full)" },
-    { value: "nai-diffusion-3", label: "NAI Diffusion V3 (Anime)" },
-    { value: "nai-diffusion-3-furry", label: "NAI Diffusion V3 (Furry)" },
+const NAI_DEFAULT_MODELS = [
+    "nai-diffusion-4-curated-preview",
+    "nai-diffusion-4-full",
+    "nai-diffusion-3",
+    "nai-diffusion-3-furry",
 ];
 
 const NAI_RESOLUTION_OPTIONS = [
@@ -94,6 +95,8 @@ export function ImageGenerationSettings() {
     const [referencePreviews, setReferencePreviews] = useState<Record<string, string>>({});
     const [models, setModels] = useState<string[]>([]);
     const [isFetchingModels, setIsFetchingModels] = useState(false);
+    const [naiModels, setNaiModels] = useState<string[]>(NAI_DEFAULT_MODELS);
+    const [isFetchingNaiModels, setIsFetchingNaiModels] = useState(false);
     const [isTesting, setIsTesting] = useState(false);
     const [status, setStatus] = useState<Status | null>(null);
     const [testPreviewUrl, setTestPreviewUrl] = useState<string | null>(null);
@@ -145,7 +148,7 @@ export function ImageGenerationSettings() {
         persist({ ...settings, ...patch });
     }, [persist, settings]);
 
-    // NovelAI 相关状态与操作
+    // NovelAI 预设管理与状态
     const naiSettings = useMemo(() => {
         const nai = settings.novelai;
         const presets = nai?.presets && nai.presets.length > 0 ? nai.presets : [DEFAULT_NOVELAI_PRESET];
@@ -240,6 +243,27 @@ export function ImageGenerationSettings() {
             setStatus({ success: false, message: err instanceof Error ? err.message : String(err) });
         } finally {
             setIsFetchingModels(false);
+        }
+    };
+
+    const fetchNaiModels = async () => {
+        setStatus(null);
+        if (!naiSettings.apiKey.trim()) {
+            setStatus({ success: false, message: "请先填写 NovelAI API Token。" });
+            return;
+        }
+        setIsFetchingNaiModels(true);
+        try {
+            const fetched = await fetchNovelAiModels(naiSettings.apiKey);
+            setNaiModels(fetched);
+            setStatus({
+                success: true,
+                message: `已获取 ${fetched.length} 个 NovelAI 常用模型列表。`,
+            });
+        } catch (err) {
+            setStatus({ success: false, message: err instanceof Error ? err.message : String(err) });
+        } finally {
+            setIsFetchingNaiModels(false);
         }
     };
 
@@ -401,30 +425,58 @@ export function ImageGenerationSettings() {
                         </div>
 
                         {/* 预设详细参数 */}
-                        <div className="grid grid-cols-2 gap-3">
-                            <div className="flex flex-col gap-1">
-                                <label className="menu-desc ml-1">模型 (Model)</label>
-                                <Select
-                                    value={naiSettings.activePreset.model}
-                                    onChange={(event) => updateActivePreset({ model: event.target.value })}
+                        <div className="flex flex-col gap-1">
+                            <label className="menu-desc ml-1">模型 (Model)</label>
+                            <div className="flex gap-2">
+                                <div className="relative flex-1">
+                                    <Input
+                                        type="text"
+                                        value={naiSettings.activePreset.model}
+                                        onChange={(event) => updateActivePreset({ model: event.target.value })}
+                                        placeholder="nai-diffusion-4-curated-preview"
+                                        className={naiModels.length > 0 ? "w-full pr-9" : "w-full"}
+                                    />
+                                    {naiModels.length > 0 && (
+                                        <>
+                                            <ChevronDown size={16} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 opacity-60" />
+                                            <select
+                                                aria-label="选择常见 NAI 模型"
+                                                value=""
+                                                onChange={(event) => {
+                                                    if (event.target.value) updateActivePreset({ model: event.target.value });
+                                                }}
+                                                className="absolute inset-y-0 right-0 w-10 cursor-pointer opacity-0"
+                                            >
+                                                <option value="">快速选择模型...</option>
+                                                {naiModels.map(m => (
+                                                    <option key={m} value={m}>{m}</option>
+                                                ))}
+                                            </select>
+                                        </>
+                                    )}
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={fetchNaiModels}
+                                    disabled={isFetchingNaiModels}
+                                    className="ui-btn ui-btn-soft-action shrink-0"
                                 >
-                                    {NAI_MODEL_OPTIONS.map(opt => (
-                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                    ))}
-                                </Select>
+                                    <RefreshCw size={16} className={isFetchingNaiModels ? "animate-spin" : ""} />
+                                    {isFetchingNaiModels ? "拉取中" : "拉取模型"}
+                                </button>
                             </div>
+                        </div>
 
-                            <div className="flex flex-col gap-1">
-                                <label className="menu-desc ml-1">分辨率 (Resolution)</label>
-                                <Select
-                                    value={naiSettings.activePreset.resolution}
-                                    onChange={(event) => updateActivePreset({ resolution: event.target.value })}
-                                >
-                                    {NAI_RESOLUTION_OPTIONS.map(opt => (
-                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                    ))}
-                                </Select>
-                            </div>
+                        <div className="flex flex-col gap-1">
+                            <label className="menu-desc ml-1">分辨率 (Resolution)</label>
+                            <Select
+                                value={naiSettings.activePreset.resolution}
+                                onChange={(event) => updateActivePreset({ resolution: event.target.value })}
+                            >
+                                {NAI_RESOLUTION_OPTIONS.map(opt => (
+                                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                ))}
+                            </Select>
                         </div>
 
                         <div className="grid grid-cols-2 gap-3">

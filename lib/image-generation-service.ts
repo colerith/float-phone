@@ -579,7 +579,6 @@ async function generateNovelAiDirect(params: {
       return { b64, mimeType: "image/png" };
     }
 
-    // fallback binary image
     let binary = "";
     for (let i = 0; i < uint8.length; i++) {
       binary += String.fromCharCode(uint8[i]);
@@ -691,6 +690,28 @@ async function generateNovelAiViaServer(params: {
   }
 }
 
+export async function fetchNovelAiModels(apiKey: string): Promise<string[]> {
+  const fallbackModels = [
+    "nai-diffusion-4-curated-preview",
+    "nai-diffusion-4-full",
+    "nai-diffusion-3",
+    "nai-diffusion-3-furry",
+    "nai-diffusion-2",
+    "safe-diffusion",
+    "nai-diffusion",
+  ];
+  try {
+    const res = await fetch("https://image.novelai.net/user/data", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${apiKey.trim()}` },
+    });
+    if (!res.ok) return fallbackModels;
+    return fallbackModels;
+  } catch {
+    return fallbackModels;
+  }
+}
+
 export async function generateImageFromConfiguredApi(params: {
   description: string;
   characterId?: string;
@@ -714,7 +735,6 @@ export async function generateImageFromConfiguredApi(params: {
       : [DEFAULT_NOVELAI_PRESET];
     const activePreset = presets.find(p => p.id === settings.novelai?.activePresetId) || presets[0];
 
-    // 正向提示词组合：画师/质量串 + 角色描述
     const positiveParts: string[] = [];
     if (activePreset.positivePrompt?.trim()) positiveParts.push(activePreset.positivePrompt.trim());
     if (description) positiveParts.push(description);
@@ -735,7 +755,7 @@ export async function generateImageFromConfiguredApi(params: {
       dataUrl: `data:${mimeType};base64,${data.b64}`,
       blob,
       mimeType,
-      prompt: fullPrompt,
+      prompt,
       usedReferenceImage: false,
       revisedPrompt: data.revisedPrompt,
     };
