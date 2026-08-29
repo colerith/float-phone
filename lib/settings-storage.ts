@@ -253,11 +253,15 @@ function normalizePresetPromptScope(prompt: Prompt): Prompt {
 export function savePresets(presets: PresetConfig[]): void {
     if (typeof window === "undefined") return;
     writePresetsCache(presets.map(stripDeprecatedPresetFields));
+    // 统一变更通知：预设管理器直接编辑保存此前不发事件，挂载中的聊天页（流式预览
+    // 标签配置等）拿不到新配置，最终清洗按新预设、预览按旧预设。监听方刷新是幂等的。
+    window.dispatchEvent(new CustomEvent("settings-presets-updated"));
 }
 
 export async function savePresetsAsync(presets: PresetConfig[]): Promise<void> {
     if (typeof window === "undefined") return;
     await writePresetsCacheAsync(presets.map(stripDeprecatedPresetFields));
+    window.dispatchEvent(new CustomEvent("settings-presets-updated"));
 }
 
 export async function ensureSettingsStorageHydrated(): Promise<void> {
@@ -323,6 +327,14 @@ export function parsePresetFromJson(text: string, fallbackName: string = "导入
         if (typeof obj.scenario_format === "string") preset.scenario_format = obj.scenario_format;
         if (typeof obj.personality_format === "string") preset.personality_format = obj.personality_format;
         if (typeof obj.story_summary_tag === "string") preset.story_summary_tag = obj.story_summary_tag;
+        // 思维链标签解析与剔除文本（导出走整对象展开，导入这里必须逐项接住，否则配置静默丢失）
+        if (typeof obj.thinking_tag === "string") preset.thinking_tag = obj.thinking_tag;
+        if (typeof obj.online_thinking_tag === "string") preset.online_thinking_tag = obj.online_thinking_tag;
+        if (typeof obj.online_thinking_enabled === "boolean") preset.online_thinking_enabled = obj.online_thinking_enabled;
+        if (typeof obj.offline_thinking_enabled === "boolean") preset.offline_thinking_enabled = obj.offline_thinking_enabled;
+        if (Array.isArray(obj.strip_texts)) {
+            preset.strip_texts = obj.strip_texts.filter((item: unknown): item is string => typeof item === "string");
+        }
 
         // Parse prompts if array
         if (Array.isArray(obj.prompts)) {

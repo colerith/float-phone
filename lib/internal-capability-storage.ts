@@ -1404,12 +1404,19 @@ function realityBridgeSubTools(): InternalToolDefinition[] {
                 ? "命令成功送达只表示已经排队；不要声称现实动作已经完成。"
                 : `需要等待 iPhone 回传${action.resultMode === "image" ? "图片" : "文本结果"}后才能判断是否完成。`,
         }));
-    const dataTools = loadBridgeDataItems().map(item => ({
+    const dataItems = loadBridgeDataItems();
+    const dataTools = dataItems.map(item => ({
         name: item.name,
         description: `${item.description}（数据由{{user}}的快捷指令定期上传到真实手机快照，返回内容附带更新时间）`,
         parameterSchema: "{}",
     }));
-    return [...shortcutTools, REALITY_BRIDGE_READ_ALL_TOOL, ...dataTools];
+    // 一个数据项都没建时不要把「查看全部手机数据」交给角色：它读的就是数据项的
+    // 快照，没有数据项就必然空手而归——角色白跑一轮，还会挤掉本该调用的快捷动作。
+    return [
+        ...shortcutTools,
+        ...(dataItems.length > 0 ? [REALITY_BRIDGE_READ_ALL_TOOL] : []),
+        ...dataTools,
+    ];
 }
 
 function buildRealityBridgeUsageGuide(): string {
@@ -1427,13 +1434,16 @@ function buildRealityBridgeUsageGuide(): string {
                 : `结果：等待手机回传${action.resultMode === "image" ? "图片" : "文本"}，最长 ${action.expiresInSeconds} 秒。`,
         );
     }
-    lines.push(
-        "",
-        "动作：查看全部手机数据",
-        "说明：读取{{user}}手机上传的全部状态快照，每项附带更新时间。",
-        "示例：[执行动作:查看全部手机数据({})]",
-    );
-    for (const item of loadBridgeDataItems()) {
+    const dataItems = loadBridgeDataItems();
+    if (dataItems.length > 0) {
+        lines.push(
+            "",
+            "动作：查看全部手机数据",
+            "说明：读取{{user}}手机上传的全部状态快照，每项附带更新时间。",
+            "示例：[执行动作:查看全部手机数据({})]",
+        );
+    }
+    for (const item of dataItems) {
         lines.push(
             "",
             `动作：${item.name}`,

@@ -14,6 +14,7 @@ import {
   loadBridgeRules,
   loadBridgeSettings,
   loadBridgeShortcutActions,
+  saveShortcutEmailReady,
   loadScreenChatSettings,
   parseBridgeActionParameterSchema,
   readBridgeStateSnapshot,
@@ -288,6 +289,8 @@ export function RealityBridgeApp({ onClose, onNotice }: {
     if (!response.ok || data.ok === false) throw new Error(data.error || "邮箱状态读取失败。");
     setShortcutEmailStatus(data);
     setShortcutEmailInput(data.recipient || "");
+    // 离线目录要同步知道邮件通道能不能用（提示词组装是同步的，取不了接口）
+    saveShortcutEmailReady(data.providerConfigured === true && data.verified === true);
   }, []);
 
   /* 快捷动作向导选了邮件模式时，拉取邮箱验证状态 */
@@ -295,6 +298,17 @@ export function RealityBridgeApp({ onClose, onNotice }: {
   useEffect(() => {
     if (editingShortcutDelivery === "email") void refreshShortcutEmailStatus().catch(() => undefined);
   }, [editingShortcutDelivery, refreshShortcutEmailStatus]);
+
+  /* 已经登记过邮件送达的动作：进页面就刷一次状态，把离线目录的就绪缓存校准。
+     只在"有邮件动作"时打这个接口，没用邮件的用户不会平白多一次请求。 */
+  const hasEnabledEmailAction = shortcutActions.some(item => item.enabled && item.deliveryMode === "email");
+  useEffect(() => {
+    if (!hasEnabledEmailAction) {
+      saveShortcutEmailReady(false);
+      return;
+    }
+    void refreshShortcutEmailStatus().catch(() => undefined);
+  }, [hasEnabledEmailAction, refreshShortcutEmailStatus]);
 
   const sendShortcutEmailCode = useCallback(async () => {
     const recipient = shortcutEmailInput.trim().toLowerCase();
@@ -1626,6 +1640,7 @@ export function RealityBridgeApp({ onClose, onNotice }: {
                   ) : (
                     <>
                       <p className="rb-help">收到触发邮件时由 iOS 自动化「立即运行」，全程无需点按。实验功能：首次运行可能仍要求权限，锁屏下部分动作可能受 iOS 限制。</p>
+                      <p className="rb-hint">邮件只是动作的触发通道：角色说的话仍走离线推送送达，所以离线推送要保持开启，否则 App 关着时这条动作也不会被触发。</p>
                       <p className="rb-wiz-tip">验证 iPhone「邮件」App 里能即时收信的邮箱（仅 iCloud / Exchange 支持实时推送）：</p>
                       {shortcutEmailVerifyBlock}
                       <p className="rb-hint">还要把发件人 <button type="button" className="rb-copychip" onClick={() => copy(shortcutEmailStatus?.senderAddress || "bridge@notify.floatbubble.top", "发件人地址")}>{shortcutEmailStatus?.senderAddress || "bridge@notify.floatbubble.top"}</button> 加入邮箱白名单，防止触发邮件进垃圾箱、自动化收不到。</p>
@@ -1711,7 +1726,7 @@ export function RealityBridgeApp({ onClose, onNotice }: {
                       onChange={event => setEditingShortcut({ ...editingShortcut, resultMode: event.target.value as BridgeShortcutAction["resultMode"] })}>
                       <option value="none">发出后立即返回，不等待结果</option>
                       <option value="text">等待快捷指令回传文本</option>
-                      <option value="image">等待快捷指令上传图片</option>
+                      <option value="image">等待快捷指令上传图片（可附文字）</option>
                     </select>
                   </label>
                   {editingShortcut.resultMode !== "none" ? (
@@ -1767,7 +1782,7 @@ export function RealityBridgeApp({ onClose, onNotice }: {
                         <i>{resultNo}</i>
                         <div className="rb-substep-body">
                           {editingShortcut.resultMode === "image" ? (
-                            <p><b>回传图片</b>：{hasParams ? null : <>先添加「获取文本」（输入选「快捷指令输入」），</>}用「获取字典值」取上传地址：字典选「文本」，键名填 <button type="button" className="rb-copychip" onClick={() => copy("resultUrl", "键名")}>resultUrl</button>；再用「获取 URL 内容」POST 到该变量，请求体选「文件」，文件选截图（≤8MB）。</p>
+                            <p><b>回传图片</b>：{hasParams ? null : <>先添加「获取文本」（输入选「快捷指令输入」），</>}用「获取字典值」取上传地址：字典选「文本」，键名填 <button type="button" className="rb-copychip" onClick={() => copy("resultUrl", "键名")}>resultUrl</button>；再用「获取 URL 内容」POST 到该变量。只传图：请求体选「文件」，文件选图片（≤8MB）。图+附文字（如截屏配 OCR 屏幕文字）：先对图片用「Base64 编码」，请求体选 JSON，加文本字段 <button type="button" className="rb-copychip" onClick={() => copy("image", "键名")}>image</button>（填编码结果）和 <button type="button" className="rb-copychip" onClick={() => copy("ocr", "键名")}>ocr</button>（填附带文字），文字会和图一起交给角色。</p>
                           ) : (
                             <p><b>回传文本</b>：{hasParams ? null : <>先添加「获取文本」（输入选「快捷指令输入」），</>}用「获取字典值」取上传地址：字典选「文本」，键名填 <button type="button" className="rb-copychip" onClick={() => copy("resultUrl", "键名")}>resultUrl</button>；再用「获取 URL 内容」POST 到该变量，请求体选 JSON，加文本字段 text 填结果。</p>
                           )}

@@ -796,7 +796,9 @@ $CRON$)`);
         ? await encryptPayload(JSON.stringify(body.cloudConfig), config.payload_key)
         : null;
       const ruleRuns = body.ruleRuns && typeof body.ruleRuns === "object" ? body.ruleRuns : {};
-      // 离线快捷动作目录：只保留云端执行需要的字段
+      // 离线快捷动作目录：只保留云端需要的字段。description / parameterSchema
+      // 是给微信通道等云端提示词注入用的——parameterSchema 一剥，云端没法教
+      // 角色写带参数的标记，配了参数的动作在离线通道就永远只会光名调用。
       const shortcutActions = (Array.isArray(body.shortcutActions) ? body.shortcutActions : [])
         .slice(0, 20)
         .map(entry => entry && typeof entry === "object" ? entry as Record<string, unknown> : {})
@@ -805,9 +807,15 @@ $CRON$)`);
           actionId: cleanText(entry.actionId, 100),
           name: cleanText(entry.name, 60),
           shortcutName: cleanText(entry.shortcutName, 80),
+          deliveryMode: cleanText(entry.deliveryMode, 10) === "email" ? "email" : "push",
           resultMode: SHORTCUT_RESULT_MODES.has(cleanText(entry.resultMode, 20)) ? cleanText(entry.resultMode, 20) : "none",
           expiresInSeconds: Math.max(30, Math.min(900, Number(entry.expiresInSeconds) || 120)),
+          ...(cleanText(entry.description, 200) ? { description: cleanText(entry.description, 200) } : {}),
+          ...(cleanText(entry.parameterSchema, 8000) ? { parameterSchema: cleanText(entry.parameterSchema, 8000) } : {}),
         }));
+      // 站点桥令牌：邮件模式的动作要靠它请站点代发（个人云没有发信服务）。
+      // 客户端没带就保持原值，不要把已存的令牌洗掉。
+      const siteBridgeToken = cleanText(body.siteBridgeToken, 100);
       const patched = await readJson<unknown[]>(await rest(`push_bridge_config?user_id=eq.${OWNER_ID}`, {
         method: "PATCH",
         headers: { Prefer: "return=representation" },
@@ -832,6 +840,21 @@ $CRON$)`);
             shortcut_actions: shortcutActions,
           }]),
         }));
+      }
+
+      // 站点桥令牌单独写一次，且失败不致命：这一列是后加的，用户没重新部署过
+      // 个人云时它根本不存在，PostgREST 会 400。要是把它塞进上面那个 PATCH，
+      // readJson 一抛错就会把规则同步、快照、动作目录整块带崩——为一个只影响
+      // 邮件代发的字段赔掉整条同步，不值。写不进去只是邮件模式用不了。
+      if (siteBridgeToken) {
+        const tokenWrite = await rest(`push_bridge_config?user_id=eq.${OWNER_ID}`, {
+          method: "PATCH",
+          headers: { Prefer: "return=minimal" },
+          body: JSON.stringify({ site_bridge_token: siteBridgeToken }),
+        }).catch(() => null);
+        if (!tokenWrite || !tokenWrite.ok) {
+          console.warn("[bridge-sync] site_bridge_token 写入失败（个人云可能需要重新部署）");
+        }
       }
 
       const deleteIds = Array.isArray(body.deleteRuleIds)
@@ -875,6 +898,8 @@ $CRON$)`);
       const actionName = cleanText(body.actionName, 60);
       const shortcutName = cleanText(body.shortcutName, 80);
       const resultMode = cleanText(body.resultMode, 20);
+      // 邮件模式的信由站点代发，本函数只建行；投递交给调用方后续单独发起。
+      const deliveryMode = cleanText(body.deliveryMode, 10) === "email" ? "email" : "push";
       const args = body.arguments && typeof body.arguments === "object" && !Array.isArray(body.arguments)
         ? body.arguments as Record<string, unknown>
         : {};
@@ -916,7 +941,7 @@ $CRON$)`);
           action_id: actionId,
           action_name: actionName,
           shortcut_name: shortcutName,
-          delivery_mode: "push",
+          delivery_mode: deliveryMode,
           callback_token: callbackToken,
           action_args: args,
           result_mode: resultMode,
@@ -926,13 +951,17 @@ $CRON$)`);
       }));
       if (!inserted[0]) return json({ ok: false, error: "命令创建失败。" }, 500);
 
-      const delivery = deferDelivery
+      // 本函数只会发 Web Push；邮件模式一律不在这里投递，由调用方转投站点代发。
+      const delivery = deferDelivery || deliveryMode === "email"
         ? { delivered: false, push: undefined }
         : await deliverShortcutCommandRow(inserted[0]);
       return json({
         ok: true,
         command: toPublicShortcutCommand(inserted[0]),
         runUrl: `${supabaseUrl}/functions/v1/ai-phone-push?action=run&command=${inserted[0].id}&ticket=${inserted[0].callback_token}`,
+        // 邮件模式要把这个地址写进信里，让 iPhone 把结果回传到本项目。
+        // 票据只随创建这一次返回，不进 toPublicShortcutCommand 的公开字段。
+        resultUrl: `${supabaseUrl}/functions/v1/push-shortcut-result?command=${inserted[0].id}&ticket=${inserted[0].callback_token}`,
         delivered: delivery.delivered,
         deferred: deferDelivery,
         push: delivery.push,
@@ -955,6 +984,9 @@ $CRON$)`);
         return json({ ok: false, error: "命令已过期。" }, 410);
       }
       if (command.status !== "pending") return json({ ok: false, error: `命令状态：${command.status}` }, 409);
+      if (command.delivery_mode === "email") {
+        return json({ ok: false, error: "邮件模式由站点代发，本网关不投递。" }, 409);
+      }
       const delivery = await deliverShortcutCommandRow(command);
       return json({ ok: true, delivered: delivery.delivered, push: delivery.push });
     }

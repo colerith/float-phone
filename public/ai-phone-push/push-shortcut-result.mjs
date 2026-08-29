@@ -2,6 +2,9 @@
 // 部署：Dashboard → Edge Functions → 新建函数 push-shortcut-result → 粘贴本文件 →
 //      关闭 JWT 校验。每条命令使用独立 callback_token 校验，无需 Supabase Auth。
 // 职责：接收文本/图片结果；图片直接写入私有 Storage；向网页提供带票据的临时读取与清理。
+//      图片模式两种请求体皆可：裸图字节（原状），或屏幕速聊式 JSON
+//      { image: Base64, ocr/text: 附带文字 }——附带文字进 result.text，续跑二轮
+//      的 resultMarker 就能带上（比如截屏 OCR 出的屏幕文字），图照旧走 imageMarker。
 
 type ShortcutCommandStatus = "pending" | "claimed" | "succeeded" | "failed" | "expired" | "cancelled";
 
@@ -41,6 +44,13 @@ function empty(status: number): Response {
 
 function cleanText(value: unknown, maxLength: number): string {
   return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+}
+
+function bytesFromBase64(value: string): Uint8Array {
+  const raw = atob(value);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i += 1) out[i] = raw.charCodeAt(i);
+  return out;
 }
 
 function detectImage(bytes: Uint8Array, declared: string): { mime: string; extension: string } | null {
@@ -187,14 +197,37 @@ Deno.serve(async (request: Request) => {
 
     if (command.result_mode === "image") {
       if (request.method !== "POST") return json({ ok: false, error: "图片必须使用 POST 上传。" }, 405);
+      const bodyContentType = (request.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+      const isJsonBody = bodyContentType === "application/json";
+      // JSON 形态比裸字节多 ~37% 的 Base64 膨胀，请求体上限相应放宽；解码后仍按 8MB 卡
+      const maxBodyBytes = isJsonBody ? Math.ceil(MAX_MEDIA_BYTES * 1.4) + 32_000 : MAX_MEDIA_BYTES;
       const declaredLength = Number(request.headers.get("content-length")) || 0;
-      if (declaredLength > MAX_MEDIA_BYTES) return json({ ok: false, error: "图片超过 8MB，请先压缩。" }, 413);
-      const buffer = await request.arrayBuffer();
-      if (buffer.byteLength === 0 || buffer.byteLength > MAX_MEDIA_BYTES) {
-        return json({ ok: false, error: buffer.byteLength === 0 ? "没有收到图片文件。" : "图片超过 8MB，请先压缩。" }, 413);
+      if (declaredLength > maxBodyBytes) return json({ ok: false, error: "图片超过 8MB，请先压缩。" }, 413);
+
+      let attachedText = "";
+      let bytes: Uint8Array;
+      if (isJsonBody) {
+        const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+        if (!body) return json({ ok: false, error: "JSON 解析失败。" }, 400);
+        attachedText = cleanText(body.ocr ?? body.text, 8000);
+        // 兼容 dataURL 前缀（快捷指令「Base64 编码」给的是裸 base64，这里防御性剥一层）
+        const imageBase64 = typeof body.image === "string"
+          ? body.image.replace(/^data:[^,]*,/, "").replace(/\s+/g, "")
+          : "";
+        if (!imageBase64) return json({ ok: false, error: "JSON 里缺少 image 字段（图片的 Base64 编码）。" }, 400);
+        try {
+          bytes = bytesFromBase64(imageBase64);
+        } catch {
+          return json({ ok: false, error: "图片 Base64 解码失败。" }, 400);
+        }
+      } else {
+        bytes = new Uint8Array(await request.arrayBuffer());
       }
-      const bytes = new Uint8Array(buffer);
-      const image = detectImage(bytes, (request.headers.get("content-type") || "").split(";")[0].trim().toLowerCase());
+      if (bytes.byteLength === 0 || bytes.byteLength > MAX_MEDIA_BYTES) {
+        return json({ ok: false, error: bytes.byteLength === 0 ? "没有收到图片文件。" : "图片超过 8MB，请先压缩。" }, 413);
+      }
+      const buffer = bytes.buffer as ArrayBuffer;
+      const image = detectImage(bytes, isJsonBody ? "" : bodyContentType);
       if (!image) return json({ ok: false, error: "只支持 JPEG、PNG 或 WebP 图片。" }, 415);
 
       const storagePath = `${command.user_id}/${command.id}.${image.extension}`;
@@ -213,7 +246,7 @@ Deno.serve(async (request: Request) => {
       mediaUrl.searchParams.set("ticket", ticket);
       mediaUrl.searchParams.set("download", "1");
       const result = {
-        text: "快捷指令已回传图片。",
+        text: attachedText || "快捷指令已回传图片。",
         mediaUrl: mediaUrl.toString(),
         mediaType: "image",
         mimeType: image.mime,

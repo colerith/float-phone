@@ -283,6 +283,8 @@ type JobPayload = {
     replyMarker: string;
     resultMarker: string;
     imageMarker?: string;
+    /** 角色 API 的图像识别开关（客户端挂快照时写入）；缺省视为开，兼容老快照 */
+    visionEnabled?: boolean;
   };
   merge?: Record<string, unknown> & { sessionId?: string };
 };
@@ -296,6 +298,31 @@ type ShortcutCommandRow = {
   error: string | null;
   expires_at: string;
 };
+
+// 【快捷动作：名称】与带参数的【快捷动作：名称({...})】都要认。参数允许换行
+// （模型爱把 JSON 展开写），所以参数段用 [\s\S] 而不是 [^\n]。
+/** 识图关着时代替截图进上下文的说明：不留这句话，模型面对的是空白，
+ *  既不知道图回没回来，也不知道自己为什么看不见。 */
+const SHORTCUT_VISION_OFF_NOTE = "（系统记录：未配置或未启用图像识别，本轮回传的图片没有交给你；请结合上一条的文字内容回应。）";
+
+const SHORTCUT_MARKER_RE = /【快捷动作[：:]\s*([^(（）)】\n]{1,60}?)\s*(?:[(（]([\s\S]{0,2000}?)[)）])?\s*】/;
+const SHORTCUT_MARKER_STRIP_RE = new RegExp(SHORTCUT_MARKER_RE.source, "g");
+
+/** 标记括号里的 JSON 参数。写坏了就当没带参数——宁可少传，也不要整条动作失败。 */
+function parseShortcutMarkerArgs(raw: string | undefined): Record<string, unknown> {
+  const text = (raw ?? "").trim();
+  if (!text) return {};
+  // 模型爱用全角标点（中文引号/冒号/逗号），原文解析失败就按归一化后的再试一次
+  const candidates = [text, text.replace(/[\u201c\u201d\u201e\u201f]/g, '"').replace(/\uff1a/g, ":").replace(/\uff0c/g, ",")];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    } catch { /* try next */ }
+  }
+  console.warn(`[push-generate] 快捷动作参数解析失败 raw=${text.slice(0, 200)}`);
+  return {};
+}
 
 function shortcutResultText(value: unknown): string {
   if (typeof value === "string") return value.trim();
@@ -625,11 +652,126 @@ Deno.serve(async (req: Request) => {
     // 动作目录在 push_bridge_config.shortcut_actions（个人云由客户端同步；
     // 老库/站点库无此列时查询失败即视为无目录，不执行）。标记一律从正文剥离。
     let shortcutActionNote = "";
+    // 实际执行过的快捷动作标记（原文+在剥离后正文中的位置）：随 outbox 带回
+    // 小手机，在原始位置落一对 tool_call/tool_notice——上下文里是标记原文，
+    // 角色下一轮才知道自己传过什么参数（否则「换一首歌」会换出同一首）
+    let executedShortcutMarker: { text: string; insertAt: number; name: string } | null = null;
     let deferredShortcutCommandId = "";
+    let deferredShortcutActionName = "";
+    type DeferredShortcutEmail = {
+      userId: string;
+      commandId: string;
+      resultUrl: string;
+      actionId: string;
+      actionName: string;
+      args: Record<string, unknown>;
+    };
+    let deferredShortcutEmail: DeferredShortcutEmail | null = null;
+    // 送达失败要让用户看得见：shortcutActionNote 只进任务日志（result_note），
+    // 而角色已经说了"我去看一眼"。把失败摘要挂进 outbox meta 带回客户端，
+    // 由客户端写进现实桥动态。成功则保持空串，不打扰。
+    let shortcutDeliveryError = "";
+    const noteShortcutDelivery = (actionName: string, note: string): string => {
+      // 按「成功」反向判断，别去枚举失败关键词——投递路径的文案有中有英，
+      // 加一句新的失败文案就会从关键词表里漏出去，静默丢掉本该给用户的提示。
+      // 这里只在真正投递出去时收到含 delivered 的 note。
+      if (!/delivered/.test(note)) {
+        shortcutDeliveryError = `快捷动作「${actionName}」未能送达：${note.replace(/^, /, "")}`.slice(0, 300);
+      }
+      return note;
+    };
+    /**
+     * 邮件模式的触发信请站点代发。个人云自己发不了信——RESEND_API_KEY 和
+     * REALITY_BRIDGE_EMAIL_FROM 是站点的环境变量，用户的 Supabase 边缘函数里
+     * 没有也不该有。命令行、结果回传、续跑快照全部留在本项目，站点只发那封信。
+     * 失败一律只回一句 note：邮件没发出去不该让整个生成任务失败。
+     */
+    const deliverShortcutEmailViaSite = async (input: {
+      userId: string;
+      commandId: string;
+      resultUrl: string;
+      actionId: string;
+      actionName: string;
+      args: Record<string, unknown>;
+    }): Promise<string> => {
+      if (!siteOrigin) return ", shortcut email skipped: site origin unknown";
+      if (!input.commandId || !input.resultUrl) return ", shortcut email skipped: command incomplete";
+      try {
+        const tokenResponse = await rest(
+          `push_bridge_config?user_id=eq.${encodeURIComponent(input.userId)}&select=site_bridge_token&limit=1`,
+        );
+        const tokenRows = tokenResponse.ok
+          ? await tokenResponse.json() as { site_bridge_token?: string | null }[]
+          : [];
+        const siteBridgeToken = String(tokenRows[0]?.site_bridge_token || "");
+        // 令牌没同步上来，绝大多数是个人云还没跑过新版 schema（site_bridge_token
+        // 是后加的列）。这句会经 outbox meta 显示给用户，所以要写成可操作的。
+        if (!siteBridgeToken) {
+          return ", 站点代发未启用：请到「设置 → 云服务部署」重新部署个人云";
+        }
+
+        const response = await fetch(`${siteOrigin}/api/push/shortcut-commands/deliver-email`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            token: siteBridgeToken,
+            actionId: input.actionId,
+            actionName: input.actionName,
+            commandId: input.commandId,
+            resultUrl: input.resultUrl,
+            arguments: input.args,
+          }),
+        });
+        const data = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
+        return response.ok && data.ok === true
+          ? ", shortcut email delivered by site"
+          : `, shortcut email failed: ${String(data.error || response.status).slice(0, 80)}`;
+      } catch (error) {
+        return `, shortcut email failed: ${(error instanceof Error ? error.message : String(error)).slice(0, 80)}`;
+      }
+    };
+    /**
+     * 快捷动作投递失败时单独落一条诊断行，而不是往角色那条消息的 meta 上补写。
+     *
+     * 补写会输给一个竞态：消息行落库并推送之后，用户点开通知，客户端可能在服务端
+     * PATCH 之前就把那行读走并 ACK 掉——恰好在"投递失败 + 用户立刻点通知"这种
+     * 情况下丢掉错误。诊断行是在投递之后才创建的，不存在赶不上的问题。
+     *
+     * trigger_key 必须留空：客户端按 trigger_key 去重，跟消息行同键会被当成重复
+     * 直接消费掉，根本走不到写动态那段。raw_text 只是占位（列是 NOT NULL），
+     * 客户端认 meta.kind 后就短路了，不会生成聊天消息。
+     */
+    const writeShortcutDeliveryDiagnostic = async () => {
+      if (!shortcutDeliveryError) return;
+      await rest("push_outbox", {
+        method: "POST",
+        body: JSON.stringify([{
+          id: `out_${crypto.randomUUID()}`,
+          user_id: job.user_id,
+          job_id: job.id,
+          session_id: payload.merge?.sessionId ?? null,
+          trigger_key: null,
+          raw_text: shortcutDeliveryError,
+          meta: { kind: "shortcut_delivery_error", shortcutDeliveryError },
+        }]),
+      }).catch(() => undefined);
+    };
+
     const deliverDeferredShortcut = async () => {
+      // 邮件命令绝不能落到下面的 shortcut-deliver：本网关只发 Web Push，
+      // 邮件模式在那边是 409。这里改请站点代发。
+      if (deferredShortcutEmail) {
+        const pending = deferredShortcutEmail;
+        deferredShortcutEmail = null;
+        shortcutActionNote += noteShortcutDelivery(pending.actionName, await deliverShortcutEmailViaSite(pending));
+        await progress(shortcutActionNote);
+        return;
+      }
       if (!deferredShortcutCommandId) return;
       const commandId = deferredShortcutCommandId;
+      const actionName = deferredShortcutActionName || "快捷动作";
       deferredShortcutCommandId = "";
+      deferredShortcutActionName = "";
       try {
         const response = await fetch(`${supabaseUrl}/functions/v1/ai-phone-push?action=shortcut-deliver`, {
           method: "POST",
@@ -644,21 +786,29 @@ Deno.serve(async (req: Request) => {
         const delivered = response.ok && data.ok === true && data.delivered === true;
         shortcutActionNote += delivered
           ? ", shortcut delivered after first reply"
-          : `, shortcut delivery failed: ${String(data.error || response.status).slice(0, 80)}`;
+          : noteShortcutDelivery(actionName, `, shortcut delivery failed: ${String(data.error || response.status).slice(0, 80)}`);
         await progress(shortcutActionNote);
       } catch (error) {
-        shortcutActionNote += `, shortcut delivery failed: ${(error instanceof Error ? error.message : String(error)).slice(0, 80)}`;
+        shortcutActionNote += noteShortcutDelivery(actionName, `, shortcut delivery failed: ${(error instanceof Error ? error.message : String(error)).slice(0, 80)}`);
         await progress(shortcutActionNote);
       }
     };
     // shortcut_resume 已经是一次动作结果后的第二轮，禁止它再次解析动作标记，
     // 避免模型不守“不要重复执行”提示时形成递归快捷动作。
     if (!payload.shortcut) {
-      const markerMatch = rawText.match(/【快捷动作[：:]\s*([^】\n]{1,60})】/);
+      const markerMatch = rawText.match(SHORTCUT_MARKER_RE);
       if (markerMatch) {
-        rawText = rawText.replace(/【快捷动作[：:][^】\n]{1,60}】/g, "").replace(/\n{3,}/g, "\n\n").trim();
+        const markerText = markerMatch[0];
+        // 标记在剥离后正文中的原始位置：对前缀做同一套清洗后取长度（尾部 trim 不影响前缀）
+        const cleanedPrefix = rawText.slice(0, markerMatch.index ?? 0)
+          .replace(SHORTCUT_MARKER_STRIP_RE, "")
+          .replace(/\n{3,}/g, "\n\n")
+          .replace(/^\s+/, "");
+        rawText = rawText.replace(SHORTCUT_MARKER_STRIP_RE, "").replace(/\n{3,}/g, "\n\n").trim();
         if (!rawText) rawText = "……";
+        const markerInsertAt = Math.min(cleanedPrefix.length, rawText.length);
         const wanted = markerMatch[1].trim();
+        const wantedArgs = parseShortcutMarkerArgs(markerMatch[2]);
         try {
           const catalogResponse = await rest(
             `push_bridge_config?user_id=eq.${encodeURIComponent(job.user_id)}&select=shortcut_actions&limit=1`,
@@ -670,6 +820,13 @@ Deno.serve(async (req: Request) => {
           const action = catalog.find(entry => String(entry.name ?? "") === wanted);
           if (action) {
             const resultMode = String(action.resultMode ?? "none");
+            // 目录里没有 deliveryMode 的是同步过来的老快照（该字段是后加的）。
+            // 退回推送仍然能用（只是要对方点一下通知，而不是自动执行），比不投递好；
+            // 但要在任务日志里留痕，否则「提示词说自动执行、实际弹了通知」查不出原因。
+            // 用户改动作或下一轮桥同步时目录会补上这个字段，属自愈。
+            const catalogHasDeliveryMode = typeof action.deliveryMode === "string";
+            const deliveryMode = String(action.deliveryMode ?? "push") === "email" ? "email" : "push";
+            if (!catalogHasDeliveryMode) shortcutActionNote += ", catalog missing deliveryMode (fell back to push)";
             const continuation = payload.shortcutContinuation;
             const canContinue = resultMode !== "none"
               && Boolean(continuation?.request && continuation.replyMarker && continuation.resultMarker);
@@ -684,16 +841,43 @@ Deno.serve(async (req: Request) => {
                 actionId: String(action.actionId ?? ""),
                 actionName: String(action.name ?? ""),
                 shortcutName: String(action.shortcutName ?? ""),
-                arguments: {},
+                arguments: wantedArgs,
                 resultMode,
+                deliveryMode,
                 expiresInSeconds: Number(action.expiresInSeconds) || undefined,
                 deferDelivery: canContinue,
               }),
             });
-            const createData = await createResponse.json().catch(() => ({})) as { ok?: boolean; command?: { id?: string } };
+            const createData = await createResponse.json().catch(() => ({})) as {
+              ok?: boolean;
+              command?: { id?: string };
+              resultUrl?: string;
+            };
             shortcutActionNote = createResponse.ok && createData.ok
               ? `shortcut sent: ${wanted}`
               : `shortcut failed: http ${createResponse.status}`;
+            if (createResponse.ok && createData.ok) {
+              executedShortcutMarker = { text: markerText, insertAt: markerInsertAt, name: wanted };
+            }
+
+            // 邮件模式：个人云没有发信服务（RESEND_API_KEY 是站点的环境变量），
+            // 请站点凭 site_bridge_token 代发那封信。命令行与结果回传仍留在本项目。
+            // 有续跑的动作等续跑任务挂稳、首条回复送达之后再发（与推送模式同序），
+            // 见下方 armed.ok 分支；这里只处理不回传结果、可以立刻触发的动作。
+            const emailDelivery: DeferredShortcutEmail = {
+              userId: job.user_id,
+              commandId: String(createData.command?.id || ""),
+              resultUrl: String(createData.resultUrl || ""),
+              actionId: String(action.actionId ?? ""),
+              actionName: String(action.name ?? ""),
+              args: wantedArgs,
+            };
+            if (createResponse.ok && createData.ok && deliveryMode === "email" && !canContinue) {
+              shortcutActionNote += noteShortcutDelivery(
+                emailDelivery.actionName,
+                await deliverShortcutEmailViaSite(emailDelivery),
+              );
+            }
 
             // 需回传结果的动作：武装 shortcut_resume 续跑任务——把刚生成的
             // 回复代入续跑快照的回复占位；结果回传后由本函数把结果代入生成下一轮。
@@ -703,8 +887,16 @@ Deno.serve(async (req: Request) => {
                 const contRequest = JSON.parse(JSON.stringify(continuation.request)) as JobPayload["request"];
                 replaceMarker(contRequest.body, continuation.replyMarker, rawText);
                 const isImage = resultMode === "image";
-                if (!isImage && continuation.imageMarker) {
-                  replaceMarker(contRequest.body, continuation.imageMarker, "（该动作没有图片回传）");
+                // 识图关着就不送图：送了轻则被模型忽略，重则接口直接 400 让整个
+                // 第二轮失败（角色说了"我去看一眼"然后没有下文）。图片位改放一句
+                // 说明，OCR 之类的附带文字仍照常经 resultMarker 抵达。
+                const canSendImage = isImage && continuation.visionEnabled !== false;
+                if (!canSendImage && continuation.imageMarker) {
+                  replaceMarker(
+                    contRequest.body,
+                    continuation.imageMarker,
+                    isImage ? SHORTCUT_VISION_OFF_NOTE : "（该动作没有图片回传）",
+                  );
                 }
                 const expiresIn = Math.max(30, Math.min(900, Number(action.expiresInSeconds) || 120));
                 const contPayload = {
@@ -714,7 +906,7 @@ Deno.serve(async (req: Request) => {
                     actionName: String(action.name ?? "快捷动作"),
                     resultMode,
                     resultMarker: continuation.resultMarker,
-                    ...(isImage && continuation.imageMarker ? { imageMarker: continuation.imageMarker } : {}),
+                    ...(canSendImage && continuation.imageMarker ? { imageMarker: continuation.imageMarker } : {}),
                     style: "text",
                   },
                   notify: payload.notify,
@@ -739,14 +931,26 @@ Deno.serve(async (req: Request) => {
                   }]),
                 });
                 await armed.text().catch(() => "");
-                if (armed.ok) {
-                  deferredShortcutCommandId = commandId;
-                  shortcutActionNote += ", continuation armed";
+                // 挂载成功与否都要把命令投递出去——命令已经以 deferDelivery 建好，
+                // 不投递它就只会静默过期：角色说了"我去看一下"，用户手机什么都收不到。
+                // 挂载失败时降级为"没有第二轮"，动作照跑，只是结果不会自动交回角色。
+                if (deliveryMode === "email") {
+                  deferredShortcutEmail = emailDelivery;
                 } else {
-                  shortcutActionNote += ", continuation arm failed";
+                  deferredShortcutCommandId = commandId;
+                  deferredShortcutActionName = emailDelivery.actionName;
                 }
+                shortcutActionNote += armed.ok
+                  ? ", continuation armed"
+                  : ", continuation arm failed (degraded to one-shot)";
               } catch {
-                shortcutActionNote += ", continuation arm failed";
+                if (deliveryMode === "email") {
+                  deferredShortcutEmail = emailDelivery;
+                } else {
+                  deferredShortcutCommandId = commandId;
+                  deferredShortcutActionName = emailDelivery.actionName;
+                }
+                shortcutActionNote += ", continuation arm failed (degraded to one-shot)";
               }
             }
           } else {
@@ -775,6 +979,10 @@ Deno.serve(async (req: Request) => {
         if (markerAt >= 0) {
           rawText = (rawText.slice(0, markerAt) + rawText.slice(markerAt + WEIXIN_MARKER.length)).trim();
           if (!rawText) rawText = "……";
+          // 微信标记被剥掉后，快捷动作标记的还原位置要跟着前移（消费端还会钳位兜底）
+          if (executedShortcutMarker && markerAt < executedShortcutMarker.insertAt) {
+            executedShortcutMarker.insertAt = Math.max(0, executedShortcutMarker.insertAt - WEIXIN_MARKER.length);
+          }
         }
         const weixinBotId = typeof payload.weixin?.botId === "string" ? payload.weixin.botId : "";
         if (!weixinBotId) await progress(`${forceWeixin ? "forced weixin" : "weixin marker"} but no bot in snapshot`);
@@ -827,6 +1035,7 @@ Deno.serve(async (req: Request) => {
         }).catch(() => undefined);
       }
       await deliverDeferredShortcut();
+      await writeShortcutDeliveryDiagnostic();
       await finish("done", `sent via weixin${shortcutActionNote ? `, ${shortcutActionNote}` : ""}`);
       return;
     }
@@ -841,7 +1050,11 @@ Deno.serve(async (req: Request) => {
         session_id: payload.merge?.sessionId ?? null,
         trigger_key: job.trigger_key,
         raw_text: rawText,
-        meta: { ...(payload.merge ?? {}), pushGenerated: true },
+        meta: {
+          ...(payload.merge ?? {}),
+          pushGenerated: true,
+          ...(executedShortcutMarker ? { shortcutMarker: executedShortcutMarker } : {}),
+        },
       }]),
     });
     if (!outboxResponse.ok) {
@@ -941,6 +1154,8 @@ Deno.serve(async (req: Request) => {
     // 第一轮正文已经落库并完成推送后，再发“运行快捷指令”通知。用户看到的
     // 顺序稳定为：角色先说话 → 运行动作 → 结果回来后角色再说话。
     await deliverDeferredShortcut();
+
+    await writeShortcutDeliveryDiagnostic();
 
     // 冷场重连的下一发：连发上限内自动排队（用户回来后客户端会撤销并按新周期重挂）
     const idleRepeat = payload.merge?.idleRepeat as

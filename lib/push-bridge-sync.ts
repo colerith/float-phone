@@ -15,7 +15,8 @@ import {
     loadChatMessages,
 } from "./chat-storage";
 import { loadCharacters } from "./character-storage";
-import { kvGet, kvSet } from "./kv-db";
+import { kvGet, kvRemove, kvSet } from "./kv-db";
+import { loadActiveAccountId } from "./account-client";
 import {
     BRIDGE_EVENT_SENTINEL,
     SCREEN_CHAT_SENTINEL,
@@ -25,6 +26,8 @@ import {
 import { hasAccountPushSubscription } from "./push-client";
 import {
     buildOfflineShortcutContinuation,
+    hasConfiguredEmailShortcutActions,
+    listEmailShortcutActionIds,
     listOfflineShortcutActions,
     maybeAppendShortcutCapability,
     maybeAppendWeixinChannel,
@@ -44,10 +47,13 @@ import {
     loadBridgeShortcutActions,
     loadScreenChatSettings,
     loadScreenChatAck,
+    saveShortcutEmailReady,
+    shortcutEmailReadyNeedsRefresh,
 } from "./reality-bridge/storage";
 import type { BridgeRule } from "./reality-bridge/types";
 
 const SYNC_HASH_KV = "push_bridge_sync_hash_v1";
+const SITE_EMAIL_RELAY_KV = "push_bridge_site_email_relay_v1";
 let syncing = false;
 let debounceTimer: number | null = null;
 
@@ -126,13 +132,13 @@ async function buildRuleSnapshot(rule: BridgeRule): Promise<Record<string, unkno
             [...history, synthetic],
             { appTags: ["chat", "text"] },
         );
-        maybeAppendShortcutCapability(llmMessages);
+        maybeAppendShortcutCapability(llmMessages, { continuationAvailable: true });
         const weixinBotId = maybeAppendWeixinChannel(llmMessages, chat.characterId);
         const request = buildProviderRequest(config, preset, toLlmRequestMessages(llmMessages));
         const shortcutContinuation = buildOfflineShortcutContinuation(llmMessages, messages => {
             const req = buildProviderRequest(config, preset, toLlmRequestMessages(messages));
             return { url: req.url, headers: req.headers, body: req.body, providerKind: req.providerKind };
-        });
+        }, config.enableImageRecognition === true);
 
         // ai 加工模式：预挂一个轻量加工请求（提示词里的 {payload} 也换成哨兵）
         let processRequest: Record<string, unknown> | undefined;
@@ -177,6 +183,114 @@ async function buildRuleSnapshot(rule: BridgeRule): Promise<Record<string, unkno
     } catch (err) {
         console.warn("[BridgeSync] snapshot build failed for rule:", rule.name, err);
         return null;
+    }
+}
+
+/**
+ * 建立「个人云 ↔ 站点」的邮件代发关联，返回站点的桥令牌（失败返回空串）。
+ *
+ * 站点侧登记个人云源站：云端请站点代发信时，信里的结果回传地址必须落在这个
+ * 源站上，否则站点拒发——令牌万一泄露也没法把快捷指令的输出引去别处。
+ * 只登记源站，不传密钥；个人云的 service key 始终不出用户自己的项目。
+ */
+async function registerSiteEmailRelay(cloudUrl: string, emailActionIds: string[]): Promise<string> {
+    try {
+        const tokenResponse = await fetch("/api/push/bridge-config", {
+            credentials: "include",
+            cache: "no-store",
+        }).catch(() => null);
+        if (!tokenResponse?.ok) return "";
+        const tokenData = await tokenResponse.json().catch(() => ({})) as { ok?: boolean; bridgeToken?: string };
+        const bridgeToken = tokenData.ok && tokenData.bridgeToken ? tokenData.bridgeToken : "";
+        if (!bridgeToken) return "";
+
+        const registered = await fetch("/api/push/bridge-config", {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            // 只带 cloudOrigin 与邮件动作白名单：规则与触发状态留在个人云，
+            // 别被这次调用洗掉
+            body: JSON.stringify({ cloudOrigin: cloudUrl, emailActionIds }),
+        }).catch(() => null);
+        return registered?.ok ? bridgeToken : "";
+    } catch {
+        return "";
+    }
+}
+
+/**
+ * 续期「邮件通道是否可用」的就绪缓存（到期才打接口）。
+ *
+ * 放在桥同步里而不是只靠现实桥页面：页面不是每台设备都会进，缓存会长期停在
+ * 旧结论上——用户取消了邮箱验证，角色还在承诺自动执行；或者换了台设备，
+ * 明明配好了却一个邮件动作都拿不到。同步是每台设备都会跑的。
+ */
+async function refreshShortcutEmailReady(): Promise<void> {
+    if (!shortcutEmailReadyNeedsRefresh()) return;
+    try {
+        const response = await fetch("/api/push/shortcut-email", {
+            credentials: "include",
+            cache: "no-store",
+        }).catch(() => null);
+        if (!response?.ok) return; // 拿不到就维持原状，别把网络抖动记成"不可用"
+        const data = await response.json().catch(() => ({})) as {
+            ok?: boolean;
+            providerConfigured?: boolean;
+            verified?: boolean;
+        };
+        if (data.ok === false) return;
+        saveShortcutEmailReady(data.providerConfigured === true && data.verified === true);
+    } catch { /* 续期失败维持原状 */ }
+}
+
+/** 邮件动作全没了：把站点白名单清空并丢掉本地登记缓存。没登记过就什么都不做。 */
+async function clearSiteEmailRelay(): Promise<void> {
+    try {
+        if (!kvGet(SITE_EMAIL_RELAY_KV)) return;
+        const cleared = await fetch("/api/push/bridge-config", {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ emailActionIds: [] }),
+        }).catch(() => null);
+        // 清不掉就留着缓存，下一轮再试；这时站点白名单仍是旧的，但代发要用的
+        // 令牌本来也已经不再同步，实际打不进来。
+        if (cleared?.ok) kvRemove(SITE_EMAIL_RELAY_KV);
+    } catch { /* 清理失败不影响本轮同步 */ }
+}
+
+/**
+ * 取站点桥令牌，登记结果按云地址缓存。
+ * 这一步跑在同步指纹短路之前，不缓存的话每个同步周期都会白打两次站点请求。
+ */
+async function resolveSiteEmailRelayToken(cloudUrl: string, emailActionIds: string[]): Promise<string> {
+    try {
+        const accountId = loadActiveAccountId();
+        // 白名单变了就必须重登记，否则新加的邮件动作会被站点按"表外动作"拒掉
+        const actionSignature = [...emailActionIds].sort().join(",");
+        const raw = kvGet(SITE_EMAIL_RELAY_KV);
+        const cached = raw ? JSON.parse(raw) as {
+            token?: string;
+            cloudUrl?: string;
+            accountId?: string;
+            actionSignature?: string;
+        } : null;
+        // 必须带账号维度：同一台设备换了站点账号、个人云地址又没变时，复用上一个
+        // 账号的令牌会让云端请站点代发时被解析成上一个账号——邮件发进别人的收件箱。
+        if (cached?.token
+            && cached.cloudUrl === cloudUrl
+            && (cached.accountId || "") === accountId
+            && (cached.actionSignature || "") === actionSignature) {
+            return cached.token;
+        }
+        const token = await registerSiteEmailRelay(cloudUrl, emailActionIds);
+        // 失败不写缓存：下个周期再试，别把一次网络抖动记成"这个账号没有令牌"
+        if (token) {
+            kvSet(SITE_EMAIL_RELAY_KV, JSON.stringify({ token, cloudUrl, accountId, actionSignature }));
+        }
+        return token;
+    } catch {
+        return "";
     }
 }
 
@@ -250,13 +364,34 @@ async function runSync(): Promise<void> {
 
         // 离线快捷动作目录：角色离线回复里的【快捷动作：名称】按它匹配执行
         const shortcutActions = listOfflineShortcutActions();
+        // 邮件送达的动作个人云自己发不了信，要请站点代发。为此两边各登记一次：
+        // 站点侧存个人云源站（校验结果回传地址），个人云侧存站点桥令牌（认账号）。
+        // 只在确实有邮件动作时才建立这层关联，纯推送用户不会平白多几次请求。
+        //
+        // 判定用 hasConfiguredEmailShortcutActions 而不是上面筛过的 shortcutActions：
+        // 后者会被就绪缓存过滤掉，缓存为假时这里就永远进不来，缓存也就永远续不上。
+        const needsSiteEmailRelay = usePersonal && hasConfiguredEmailShortcutActions();
+        if (needsSiteEmailRelay) await refreshShortcutEmailReady();
+        const emailActionIds = needsSiteEmailRelay ? listEmailShortcutActionIds() : [];
+        const siteBridgeToken = needsSiteEmailRelay
+            ? await resolveSiteEmailRelayToken(cloudConfig.url, emailActionIds)
+            : "";
+        // 最后一个邮件动作被删/禁用后 needsSiteEmailRelay 直接变 false，登记流程
+        // 不再走，站点里的旧白名单就会残留。既然做了白名单，这条边界要收干净：
+        // 有过登记记录才去清一次，清完丢掉缓存，避免每轮都白打一次请求。
+        if (!needsSiteEmailRelay && usePersonal) await clearSiteEmailRelay();
+        // 就绪状态可能刚被刷新（例如用户去站点验完邮箱），重取一次目录，
+        // 否则这一轮同步上去的目录还是缺邮件动作，要等下一轮才生效。
+        const syncedShortcutActions = needsSiteEmailRelay ? listOfflineShortcutActions() : shortcutActions;
 
         // 内容指纹：触发状态也必须参与，否则本地刚执行过的规则不会刷新服务端冷却。
         const configFingerprint = JSON.stringify({
             serverRules,
             cloud: { url: cloudConfig.url, key: cloudConfig.key },
             ruleRuns,
-            shortcutActions,
+            shortcutActions: syncedShortcutActions,
+            siteEmailRelay: needsSiteEmailRelay && Boolean(siteBridgeToken),
+            emailActionIds,
         });
         const snapshotRules = rules.filter(rule => rule.actions?.chat?.requestReply);
         const snapshots: { ruleId: string; payload: Record<string, unknown> }[] = [];
@@ -286,7 +421,8 @@ async function runSync(): Promise<void> {
                     rules: serverRules,
                     cloudConfig: { url: cloudConfig.url, key: cloudConfig.key },
                     ruleRuns,
-                    shortcutActions,
+                    shortcutActions: syncedShortcutActions,
+                    ...(siteBridgeToken ? { siteBridgeToken } : {}),
                     snapshots,
                     deleteRuleIds,
                 }),

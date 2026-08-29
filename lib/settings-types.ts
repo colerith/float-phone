@@ -82,6 +82,19 @@ export type PresetConfig = SettingItemMeta & {
     scenario_format?: string;
     personality_format?: string;
     story_summary_tag?: string;
+    /** 线下/剧情模式的思维链标签名：从模型输出的 XML 里提取思考过程（默认 thinking，兼容 thought）。
+     *  仅当 offline_thinking_enabled 开启时才启用标签解析；关闭时走模型原生 reasoning。 */
+    thinking_tag?: string;
+    /** 线上模式的思维链标签名：从模型输出的 XML 里提取思考过程（默认 thinking）。
+     *  仅当 online_thinking_enabled 开启时才启用标签解析；关闭时走模型原生 reasoning。 */
+    online_thinking_tag?: string;
+    /** 线上模式是否启用思维链标签解析（默认关；关 = 走模型原生 reasoning） */
+    online_thinking_enabled?: boolean;
+    /** 线下模式是否启用思维链标签解析（默认关；关 = 走模型原生 reasoning） */
+    offline_thinking_enabled?: boolean;
+    /** 模型回复中直接剔除的文本片段列表（字面量删除，不走正则）：如 <思考结束> 等残留标签，
+     *  生成时即删除，不进入消息、不进入发给模型的记录。 */
+    strip_texts?: string[];
     prompt_order?: PromptOrderEntry[];
     prompts: Prompt[];
 };

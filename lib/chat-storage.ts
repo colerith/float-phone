@@ -57,6 +57,10 @@ export type ChatSession = {
     offlineBilingualTranslationPrompt?: string;
     nativeExpandedToolSourceIds?: string[];
     visionImagePromptLimit?: number;
+    /** 流式生成（线上）：开启后该会话的线上 AI 回复边生成边显示（默认关，保持原整段请求行为） */
+    streamOnline?: boolean;
+    /** 流式生成（线下）：开启后该会话的线下 AI 回复边生成边显示（默认关，保持原整段请求行为） */
+    streamOffline?: boolean;
     // Group chat fields
     isGroup?: boolean;
     groupName?: string;
@@ -267,6 +271,12 @@ export function getMaxToolRounds(): number {
     const raw = loadChatAppSettings().maxToolRounds;
     if (typeof raw !== "number" || !Number.isFinite(raw)) return 5;
     return Math.max(1, Math.min(20, Math.round(raw)));
+}
+
+/** 会话是否开启线上流式生成（默认关；按会话独立控制，单聊/群聊都生效） */
+export function isSessionStreamingEnabled(session: Pick<ChatSession, "streamOnline" | "streamOffline"> | null | undefined, online: boolean): boolean {
+    if (!session) return false;
+    return online ? session.streamOnline === true : session.streamOffline === true;
 }
 
 export const CHAT_APP_SETTINGS_UPDATED_EVENT = "chat-app-settings-updated";
@@ -1091,6 +1101,23 @@ export function deleteChatSession(sessionId: string) {
     clearChatSessionMessages(sessionId); // Cleanup associated messages
 }
 
+// 把一个会话的全部消息挪到另一个会话名下（重复会话合并用）。
+// 两边的 order 序号各自从 0 起，直接混排会串位，挪完后按时间重排目标会话。
+export function reassignChatSessionMessages(fromSessionId: string, toSessionId: string): number {
+    if (fromSessionId === toSessionId) return 0;
+    const changed: ChatMessage[] = [];
+    _messagesCache = _messagesCache.map(message => {
+        if (message.sessionId !== fromSessionId) return message;
+        const updated = { ...message, sessionId: toSessionId };
+        changed.push(updated);
+        return updated;
+    });
+    if (changed.length === 0) return 0;
+    dbPutMessages(changed);
+    reindexSessionMessageOrdersByTime(toSessionId);
+    return changed.length;
+}
+
 // ── CRUD for Messages ─────────────────────────
 export function loadChatMessages(sessionId: string, limit?: number): ChatMessage[] {
     const all = getSortedSessionMessages(sessionId);
@@ -1136,16 +1163,26 @@ export function pushChatMessage(msg: Omit<ChatMessage, "id" | "createdAt" | "sta
     dbPutMessage(newMsg);
 
     // Auto update session last message only for records that can produce a list preview.
+    // 优化：直接增量更新内存会话缓存并异步写单条，避免每次发送都走 loadChatSessions +
+    // saveChatSessions 触发全量会话预览重算（会话/消息多了以后会明显卡顿）。
     const preview = getChatMessagePreview(newMsg);
-    const sessions = loadChatSessions();
-    const sessIdx = sessions.findIndex(s => s.id === msg.sessionId);
+    const sessIdx = _sessionsCache.findIndex(s => s.id === msg.sessionId);
     if (sessIdx !== -1 && isSessionPreviewCandidate(newMsg)) {
-        sessions[sessIdx].lastMessageId = newMsg.id;
-        if (preview) {
-            sessions[sessIdx].lastMessagePreview = preview;
+        const target = _sessionsCache[sessIdx];
+        target.lastMessageId = newMsg.id;
+        if (preview) target.lastMessagePreview = preview;
+        target.updatedAt = newMsg.createdAt;
+        dbPutSessions([target]);
+    } else if (sessIdx === -1) {
+        // 缓存未命中（极端情况）：回退全量路径，保证列表预览仍会刷新
+        const sessions = loadChatSessions();
+        const idx2 = sessions.findIndex(s => s.id === msg.sessionId);
+        if (idx2 !== -1 && isSessionPreviewCandidate(newMsg)) {
+            sessions[idx2].lastMessageId = newMsg.id;
+            if (preview) sessions[idx2].lastMessagePreview = preview;
+            sessions[idx2].updatedAt = newMsg.createdAt;
+            saveChatSessions(sessions);
         }
-        sessions[sessIdx].updatedAt = newMsg.createdAt;
-        saveChatSessions(sessions);
     }
 
     if (typeof window !== "undefined") {

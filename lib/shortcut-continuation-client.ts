@@ -6,6 +6,10 @@ import type { RegexConfig } from "./settings-types";
 import { isSelfHostedModeEnabled } from "./self-hosting";
 import { cleanupShortcutCommandMedia } from "./shortcut-command-media-client";
 
+/** 识图关着时代替截图进上下文的说明：不留这句话，模型面对的是空白，
+ *  既不知道图回没回来，也不知道自己为什么看不见。云端三条通道用同一句。 */
+export const SHORTCUT_VISION_OFF_NOTE = "（系统记录：未配置或未启用图像识别，本轮回传的图片没有交给你；请结合上一条的文字内容回应。）";
+
 export type ShortcutContinuationStyle = "text" | "native";
 
 export type ShortcutContinuationHandle = {

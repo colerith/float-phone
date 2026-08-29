@@ -171,7 +171,12 @@ export async function armReplyBailout(params: {
             },
         }),
     }).catch(() => null);
-    if (!response || !response.ok) return null;
+    if (!response || !response.ok) {
+        // 413 = 快照超过服务端 900KB 上限（提示词太大/贴图太多）。以前这里
+        // 完全静默，用户只会发现"App 被杀后没收到回复"却查不到原因。
+        if (response) console.warn("[PushBailout] 回复兜底预约失败：HTTP", response.status);
+        return null;
+    }
     if (params.signal?.aborted) {
         await deleteBailoutJob(triggerKey);
         return null;
@@ -269,8 +274,15 @@ export async function armFollowUpBailout(
             messagesWithHint,
             { appTags: ["chat", "text", "followup"], followUpCount: count, followUpDelay: delaySec },
         );
-        // 无工具重放：服务端执行不了本地工具循环，兜底生成按纯补全组装。
+        // 无原生工具重放：服务端执行不了本地工具循环，兜底生成按纯补全组装。
+        // 但标记式快捷动作云端是支持的（push-generate 解析【快捷动作：名称】），
+        // 所以照常注入动作目录，别让角色在离线追问里以为自己什么都做不了。
+        maybeAppendShortcutCapability(llmMessages, { continuationAvailable: true });
         const request = buildProviderRequest(config, preset, toLlmRequestMessages(llmMessages));
+        const shortcutContinuation = buildOfflineShortcutContinuation(llmMessages, messages => {
+            const req = buildProviderRequest(config, preset, toLlmRequestMessages(messages));
+            return { url: req.url, headers: req.headers, body: req.body, providerKind: req.providerKind };
+        }, config.enableImageRecognition === true);
 
         // 组装耗时不短——上传前复核排期还在且没被改过（用户可能已回复触发了取消）
         const latestSchedule = loadFollowUpSchedule(sessionId);
@@ -291,6 +303,7 @@ export async function armFollowUpBailout(
                         providerKind: request.providerKind,
                     },
                     notify: { title: character.name, url: "/" },
+                    ...(shortcutContinuation ? { shortcutContinuation } : {}),
                     merge: {
                         sessionId,
                         followUpIndex: count,
@@ -419,13 +432,13 @@ export async function armIdleReconnectBailout(rule: IdleReconnectRule): Promise<
             { appTags: ["chat", "text", "idle_wake"], timedWakeElapsedMinutes: elapsedMinutes },
         );
         maybeAppendCallInvite(llmMessages, rule.characterId);
-        maybeAppendShortcutCapability(llmMessages);
+        maybeAppendShortcutCapability(llmMessages, { continuationAvailable: true });
         const weixinBotId = maybeAppendWeixinChannel(llmMessages, rule.characterId);
         const request = buildProviderRequest(config, preset, toLlmRequestMessages(llmMessages));
         const shortcutContinuation = buildOfflineShortcutContinuation(llmMessages, messages => {
             const req = buildProviderRequest(config, preset, toLlmRequestMessages(messages));
             return { url: req.url, headers: req.headers, body: req.body, providerKind: req.providerKind };
-        });
+        }, config.enableImageRecognition === true);
         const remaining = IDLE_RECONNECT_MAX_CONSECUTIVE - effectiveConsecutive - 1;
         // 先挂后清：POST 本身按同键先删后插（幂等覆盖），挂稳后再清理同前缀的其他旧键
         //（旧连发序号、服务端续排的 "+" 后缀键）。之前是先清后挂，切后台/杀进程
@@ -485,13 +498,13 @@ export async function armTimedWakeBailout(schedule: TimedWakeSchedule): Promise<
             { appTags: ["chat", "text", wakeTag], timedWakeElapsedMinutes: elapsedMinutes, timedWakeIntent: schedule.intent },
         );
         maybeAppendCallInvite(llmMessages, schedule.characterId);
-        maybeAppendShortcutCapability(llmMessages);
+        maybeAppendShortcutCapability(llmMessages, { continuationAvailable: true });
         const weixinBotId = maybeAppendWeixinChannel(llmMessages, schedule.characterId);
         const request = buildProviderRequest(config, preset, toLlmRequestMessages(llmMessages));
         const shortcutContinuation = buildOfflineShortcutContinuation(llmMessages, messages => {
             const req = buildProviderRequest(config, preset, toLlmRequestMessages(messages));
             return { url: req.url, headers: req.headers, body: req.body, providerKind: req.providerKind };
-        });
+        }, config.enableImageRecognition === true);
         const posted = await postBailoutJob({
             triggerKey: `timedwake:${schedule.id}`,
             kind: "timed_task",
@@ -554,13 +567,19 @@ export async function armPeriodCareBailouts(): Promise<void> {
                     history,
                     { appTags: ["chat", "text", "period_care"], periodCareContext: event.context },
                 );
+                maybeAppendShortcutCapability(llmMessages, { continuationAvailable: true });
                 const request = buildProviderRequest(apiConfig, preset, toLlmRequestMessages(llmMessages));
+                const shortcutContinuation = buildOfflineShortcutContinuation(llmMessages, messages => {
+                    const req = buildProviderRequest(apiConfig, preset, toLlmRequestMessages(messages));
+                    return { url: req.url, headers: req.headers, body: req.body, providerKind: req.providerKind };
+                }, apiConfig.enableImageRecognition === true);
                 await postBailoutJob({
                     triggerKey: `periodcare:${session.contactId}:${event.cycleKey}`,
                     kind: "timed_task",
                     executeAtMs,
                     request,
                     notifyTitle: characterName,
+                    shortcutContinuation,
                     merge: {
                         sessionId: session.id,
                         prevCount: 0,

@@ -1,6 +1,7 @@
 "use client";
 
 import { kvGet, kvSet, registerKvMigration } from "../kv-db";
+import { loadActiveAccountId } from "../account-client";
 import { loadCloudBackupConfig, isCloudBackupConfigured, type CloudBackupConfig } from "../cloud-backup/config";
 import { claimObject, getObject, listObjects, putObject, removeObject } from "../cloud-backup/storage-client";
 import {
@@ -20,6 +21,7 @@ const BRIDGE_DATA_ITEMS_KEY = "ai_phone_reality_bridge_data_items_v1";
 const BRIDGE_SHORTCUT_ACTIONS_KEY = "ai_phone_reality_bridge_shortcut_actions_v1";
 const BRIDGE_RULE_RUNS_KEY = "ai_phone_reality_bridge_rule_runs_v1";
 const BRIDGE_SCREEN_CHAT_KEY = "ai_phone_reality_bridge_screen_chat_v1";
+const BRIDGE_EMAIL_READY_KEY = "ai_phone_reality_bridge_email_ready_v1";
 const FEED_LIMIT = 200;
 
 registerKvMigration(BRIDGE_RULES_KEY);
@@ -29,6 +31,7 @@ registerKvMigration(BRIDGE_DATA_ITEMS_KEY);
 registerKvMigration(BRIDGE_SHORTCUT_ACTIONS_KEY);
 registerKvMigration(BRIDGE_RULE_RUNS_KEY);
 registerKvMigration(BRIDGE_SCREEN_CHAT_KEY);
+registerKvMigration(BRIDGE_EMAIL_READY_KEY);
 
 export type BridgeSettings = {
   enabled: boolean;
@@ -228,6 +231,56 @@ export function loadBridgeShortcutActions(): BridgeShortcutAction[] {
 
 export function saveBridgeShortcutActions(actions: BridgeShortcutAction[]): void {
   kvSet(BRIDGE_SHORTCUT_ACTIONS_KEY, JSON.stringify(actions.slice(0, 30)));
+}
+
+/* ---------- 邮件通道就绪缓存 ----------
+ * 「站点已配好发信服务 + 收件人已验证」这件事只有接口知道，而提示词组装
+ * （availableActions）是同步的，取不了接口，所以把结论缓存下来。
+ * 读不到就当没就绪——宁可少给一个动作，也不让角色请求一个发不出去的动作。
+ *
+ * 带过期时间：用户取消邮箱验证、或站点把发信服务撤了，缓存不会一直停在
+ * 「可用」上让角色白白承诺。过期后由桥同步（push-bridge-sync）自动续期，
+ * 不依赖用户主动进现实桥页面，也不会让不同设备长期给出不同答案。 */
+const SHORTCUT_EMAIL_READY_TTL_MS = 12 * 60 * 60 * 1000;
+
+type ShortcutEmailReadyCache = { ready: boolean; at: number; accountId: string };
+
+function readShortcutEmailReadyCache(): ShortcutEmailReadyCache | null {
+  try {
+    const raw = kvGet(BRIDGE_EMAIL_READY_KEY);
+    if (!raw) return null;
+    // 旧版写的是裸 "1"/"0"（无时间戳）：一律当作已过期，走一次续期即可。
+    if (raw === "1" || raw === "0") return null;
+    const parsed = JSON.parse(raw) as Partial<ShortcutEmailReadyCache>;
+    if (typeof parsed?.ready !== "boolean" || typeof parsed?.at !== "number") return null;
+    // 换账号后不复用上一个账号的结论（缓存无账号维度会导致跨账号误判）
+    if ((parsed.accountId || "") !== loadActiveAccountId()) return null;
+    return { ready: parsed.ready, at: parsed.at, accountId: parsed.accountId || "" };
+  } catch {
+    return null;
+  }
+}
+
+export function loadShortcutEmailReady(): boolean {
+  const cache = readShortcutEmailReadyCache();
+  if (!cache) return false;
+  return cache.ready && Date.now() - cache.at < SHORTCUT_EMAIL_READY_TTL_MS;
+}
+
+/** 缓存是否需要续期（不存在、已过期、或曾经写坏）。 */
+export function shortcutEmailReadyNeedsRefresh(): boolean {
+  const cache = readShortcutEmailReadyCache();
+  return !cache || Date.now() - cache.at >= SHORTCUT_EMAIL_READY_TTL_MS;
+}
+
+export function saveShortcutEmailReady(ready: boolean): void {
+  try {
+    kvSet(BRIDGE_EMAIL_READY_KEY, JSON.stringify({
+      ready,
+      at: Date.now(),
+      accountId: loadActiveAccountId(),
+    } satisfies ShortcutEmailReadyCache));
+  } catch { /* 缓存写失败只是少给一个动作，不影响主流程 */ }
 }
 
 export function parseBridgeActionParameterSchema(value: string): Record<string, unknown> | null {

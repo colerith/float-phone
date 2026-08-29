@@ -148,6 +148,9 @@ create table if not exists public.push_bridge_config (
 create index if not exists push_bridge_config_token_idx on public.push_bridge_config (bridge_token);
 -- 离线快捷动作目录：角色离线回复输出【快捷动作：名称】时按它匹配执行
 alter table public.push_bridge_config add column if not exists shortcut_actions jsonb not null default '[]'::jsonb;
+-- 站点的桥令牌（明文，非密钥）。邮件模式的快捷动作个人云自己发不了信（没有
+-- RESEND_API_KEY），要把「代发那封信」外包给站点，凭这个令牌认账号。
+alter table public.push_bridge_config add column if not exists site_bridge_token text;
 
 create table if not exists public.push_bridge_snapshots (
   user_id text not null,

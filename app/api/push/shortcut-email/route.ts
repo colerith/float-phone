@@ -9,14 +9,15 @@ import {
 } from "@/lib/server/shortcut-email-service";
 import { formatSupabaseRestError, getSupabaseServerConfig } from "@/lib/server/supabase-rest";
 
-async function accountFor(request: Request) {
-  if (!getSupabaseServerConfig()) return null;
-  return getCurrentAccount(request);
-}
+// 未配置站点 Supabase 与未登录是两回事：单机模式下账号永远是 local_user，
+// 若把配置缺失也报成「请先登录」，自部署用户会以为要开账号系统。
+const notConfigured = () =>
+  NextResponse.json({ ok: false, error: "站点尚未配置 Supabase，邮件自动通道未开通。" }, { status: 503 });
 
 export async function GET(request: Request) {
   try {
-    const account = await accountFor(request);
+    if (!getSupabaseServerConfig()) return notConfigured();
+    const account = await getCurrentAccount(request);
     if (!account) return NextResponse.json({ ok: false, error: "请先登录账号。" }, { status: 401 });
     return NextResponse.json({ ok: true, ...(await getShortcutEmailStatus(account.id)) });
   } catch (err) {
@@ -26,7 +27,8 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    const account = await accountFor(request);
+    if (!getSupabaseServerConfig()) return notConfigured();
+    const account = await getCurrentAccount(request);
     if (!account) return NextResponse.json({ ok: false, error: "请先登录账号。" }, { status: 401 });
     const body = await request.json().catch(() => ({})) as Record<string, unknown>;
     const verificationExpiresAt = await beginShortcutEmailVerification(account.id, body.recipient);
@@ -40,7 +42,8 @@ export async function POST(request: Request) {
 
 export async function PATCH(request: Request) {
   try {
-    const account = await accountFor(request);
+    if (!getSupabaseServerConfig()) return notConfigured();
+    const account = await getCurrentAccount(request);
     if (!account) return NextResponse.json({ ok: false, error: "请先登录账号。" }, { status: 401 });
     const body = await request.json().catch(() => ({})) as Record<string, unknown>;
     const recipient = await confirmShortcutEmailVerification(account.id, body.code);
@@ -54,7 +57,8 @@ export async function PATCH(request: Request) {
 
 export async function DELETE(request: Request) {
   try {
-    const account = await accountFor(request);
+    if (!getSupabaseServerConfig()) return notConfigured();
+    const account = await getCurrentAccount(request);
     if (!account) return NextResponse.json({ ok: false, error: "请先登录账号。" }, { status: 401 });
     await removeShortcutEmailVerification(account.id);
     return NextResponse.json({ ok: true });

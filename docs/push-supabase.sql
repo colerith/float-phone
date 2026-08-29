@@ -139,6 +139,75 @@ create table if not exists public.push_shortcut_email_config (
 alter table public.push_shortcut_email_config
   add column if not exists verification_attempts integer not null default 0;
 
+-- 云端代发邮件的频控窗口（个人云离线生成触发邮件模式快捷动作时用固定窗口计数）
+alter table public.push_shortcut_email_config
+  add column if not exists cloud_delivery_count integer not null default 0;
+alter table public.push_shortcut_email_config
+  add column if not exists cloud_delivery_window_start timestamptz;
+
+-- 云端代发邮件的频控：行锁下读改写，两个并发请求不会都读到同一个旧计数而双双放行。
+-- 返回 true 表示本次获得配额。RPC 不存在时 API 路由会退回非原子的读改写实现，
+-- 老库不执行本段也不会坏，只是并发下同一窗口可能多放行一两封。
+--
+-- 窗口与上限写死在函数里，不接受调用方指定：这是 security definer 函数，会绕过
+-- RLS，参数越少攻击面越小。下面还会把 PUBLIC 的执行权限收掉，只留 service_role。
+-- 早期版本是三参数签名，先删掉，避免两个重载并存。
+drop function if exists public.push_shortcut_email_claim_slot(text, integer, integer);
+
+create or replace function public.push_shortcut_email_claim_slot(p_user_id text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_window_seconds constant integer := 60;
+  v_max constant integer := 6;
+  v_row public.push_shortcut_email_config;
+  v_within boolean;
+  v_count integer;
+begin
+  select * into v_row from public.push_shortcut_email_config
+    where user_id = p_user_id for update;
+  if not found then
+    return false;
+  end if;
+
+  v_within := v_row.cloud_delivery_window_start is not null
+    and now() - v_row.cloud_delivery_window_start < make_interval(secs => v_window_seconds);
+  v_count := case when v_within then coalesce(v_row.cloud_delivery_count, 0) else 0 end;
+
+  if v_within and v_count >= v_max then
+    return false;
+  end if;
+
+  update public.push_shortcut_email_config
+    set cloud_delivery_count = v_count + 1,
+        cloud_delivery_window_start = case when v_within then cloud_delivery_window_start else now() end,
+        updated_at = now()
+    where user_id = p_user_id;
+  return true;
+end;
+$$;
+
+-- security definer 函数默认对 PUBLIC 可执行，而 PostgREST 会把 public schema 下的
+-- 函数暴露成 /rpc/ 端点。不收权限的话，未认证调用方就能以函数所有者身份改别人的
+-- 频控行（顶满计数即可让那个账号的云端邮件一直被 429），自部署模式下 user_id 固定
+-- 是 local_user，连猜都不用猜。这里只留 service_role。
+revoke all on function public.push_shortcut_email_claim_slot(text) from public;
+do $$
+begin
+  execute 'revoke all on function public.push_shortcut_email_claim_slot(text) from anon, authenticated';
+exception when undefined_object then
+  null; -- 非 Supabase 环境没有这两个角色，忽略
+end $$;
+do $$
+begin
+  execute 'grant execute on function public.push_shortcut_email_claim_slot(text) to service_role';
+exception when undefined_object then
+  null;
+end $$;
+
 -- 快捷指令截图临时存储：私有桶，只能经 push-shortcut-result Edge Function
 -- 使用每条命令的 callback_token 上传/读取。
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
@@ -167,6 +236,19 @@ create table if not exists public.push_bridge_config (
   daily_count jsonb not null default '{}'::jsonb,
   updated_at timestamptz not null default now()
 );
+
+-- 个人云的 Supabase 源站（明文，非密钥）。云端离线生成触发邮件模式的快捷动作时，
+-- 站点只负责代发那封信；信里的结果回传地址必须落在这个源站上，否则拒发——
+-- 防止 bridge_token 泄露后被人把快捷指令的输出引到别处。
+alter table public.push_bridge_config
+  add column if not exists cloud_origin text;
+
+-- 允许云端代发的邮件动作白名单（只存 actionId，不含动作名与参数）。站点看不到
+-- 个人云那张命令表，没有这份名单就只能相信调用方报上来的 actionId——拿到
+-- bridge_token 的人可以指定任意动作触发邮件。快捷指令是用户自己登记的，不能假定
+-- 它永远只是截图、读数据这类低危操作。
+alter table public.push_bridge_config
+  add column if not exists email_action_ids text[] not null default '{}'::text[];
 
 -- 每条「让TA回话」规则的 prompt 快照（带占位符，客户端防抖刷新）
 create table if not exists public.push_bridge_snapshots (

@@ -19,6 +19,9 @@ const LOCK_PREFIX = "weixin-cloud/locks";
 const PENDING_FLAG_PREFIX = "weixin-cloud/pending";
 const WEIXIN_SHORTCUT_RESULT_MARKER = "__FLOAT_WEIXIN_SHORTCUT_RESULT__";
 const WEIXIN_SHORTCUT_IMAGE_MARKER = "__FLOAT_WEIXIN_SHORTCUT_IMAGE__";
+// 识图关着时代替截图进上下文的说明：不留这句话，模型面对的是空白，
+// 既不知道图回没回来，也不知道自己为什么看不见。
+const SHORTCUT_VISION_OFF_NOTE = "（系统记录：未配置或未启用图像识别，本轮回传的图片没有交给你；请结合上一条的文字内容回应。）";
 const ILINK_BASE = "https://ilinkai.weixin.qq.com";
 const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 const BASE_INFO = { channel_version: "1.0.2" };
@@ -326,6 +329,7 @@ async function autoReplyPendingMessages(env, runtime, options = {}) {
           shortcutRequest.action,
           generation.messages,
           replyText,
+          shortcutRequest.args,
         );
       } catch (err) {
         console.warn(`[weixin-assistant] 快捷动作准备失败 bot=${runtime.bot.id}: ${errorMessage(err)}`);
@@ -374,9 +378,11 @@ async function autoReplyPendingMessages(env, runtime, options = {}) {
       failedCount: sendErrors.length,
       sendResults,
       ...(deferredShortcut ? { shortcutCommandId: deferredShortcut.commandId } : {}),
-    });
+    }, undefined, deferredShortcut && shortcutRequest.marker
+      ? { text: shortcutRequest.marker.text, insertAt: shortcutRequest.marker.insertAt, name: deferredShortcut.actionName }
+      : undefined);
     if (deferredShortcut) {
-      const delivered = await deliverWeixinShortcut(env, deferredShortcut.commandId).catch(err => ({
+      const delivered = await deliverWeixinShortcut(env, deferredShortcut).catch(err => ({
         ok: false,
         error: errorMessage(err),
       }));
@@ -522,7 +528,12 @@ async function loadWeixinShortcutActions(env) {
         shortcutName: String(action?.shortcutName || "").trim(),
         description: String(action?.description || "").trim(),
         resultMode,
+        // 这里以前漏了 deliveryMode，于是不管用户配的是不是邮件自动执行，
+        // 建命令时都退成 push，最后必然弹一条要点按的通知。
+        deliveryMode: String(action?.deliveryMode || "push") === "email" ? "email" : "push",
         expiresInSeconds: Math.max(30, Math.min(900, Number(action?.expiresInSeconds) || 120)),
+        // 参数 JSON Schema 原文（客户端同步时已验证过能解析）：能力菜单据此教角色写带参标记
+        parameterSchema: String(action?.parameterSchema || "").trim().slice(0, 8000),
       };
     }).filter(action => action.actionId && action.name && action.shortcutName).slice(0, 20);
   } catch {
@@ -542,29 +553,87 @@ function appendWeixinShortcutCapability(messages, actions) {
       "<tool_availability>当前对话正通过微信进行：原生工具调用不可用；但下方明确列出的 iPhone 快捷动作可以使用。不要输出其他工具调用格式。</tool_availability>",
     );
   }
-  const menu = actions.map(action => action.description
-    ? `「${action.name}」（${action.description.slice(0, 40)}）`
-    : `「${action.name}」`).join("、");
+  // 把动作的参数 schema 压成一句人话（与站内 describeActionParameters 同口径），
+  // 让角色知道括号里该写什么。schema 缺失或解析不了就当无参数。
+  const describeParameters = (action) => {
+    try {
+      const schema = JSON.parse(String(action.parameterSchema || "") || "{}");
+      const properties = schema && typeof schema.properties === "object" && schema.properties !== null
+        ? schema.properties
+        : null;
+      const names = properties ? Object.keys(properties).slice(0, 8) : [];
+      if (names.length === 0) return "";
+      const required = new Set(Array.isArray(schema.required) ? schema.required.map(item => String(item)) : []);
+      return `［参数：${names.map(name => required.has(name) ? `${name}（必填）` : name).join("、")}］`;
+    } catch {
+      return "";
+    }
+  };
+  const described = actions.map(action => ({ action, parameters: describeParameters(action) }));
+  const menu = described.map(({ action, parameters }) => {
+    const description = action.description ? `（${action.description.slice(0, 40)}）` : "";
+    // 邮件送达由 iOS 自动化直接跑，推送送达要对方点通知——这会影响角色的措辞
+    const channel = action.deliveryMode === "email" ? "〔自动执行〕" : "〔需对方点确认〕";
+    return `「${action.name}」${description}${channel}${parameters}`;
+  }).join("、");
+  const hasParameters = described.some(item => item.parameters !== "");
   messages.push({
     role: "system",
     content: "（可选能力：你可以请求在对方的 iPhone 上执行这些快捷动作：" + menu
       + "。确有需要时，在回复中单独一行输出【快捷动作：动作名】，动作名必须与上面完全一致；"
-      + "系统会先把你本轮的其他话发到微信，再提示对方运行。会回传结果的动作，结果之后会自动交给你继续回复。"
+      + (hasParameters
+        ? "带参数的动作写成【快捷动作：动作名({\"参数名\":\"值\"})】，括号里是一个 JSON 对象；没有参数的动作不要写括号。"
+        : "")
+      + "系统会先把你本轮的其他话发到微信，再触发动作："
+      + "标着〔自动执行〕的对方手机会直接跑，标着〔需对方点确认〕的会先弹一条运行提示、TA点一下才执行。"
+      + "会回传结果的动作，结果之后会自动交给你继续回复。"
       + "不需要就不要输出，也不要解释本条说明。）",
   });
 }
 
 export function extractWeixinShortcutRequest(text, actions = []) {
   const raw = String(text || "");
-  const match = raw.match(/【快捷动作[：:]\s*([^】\n]{1,60})】/);
-  if (!match) return { text: raw.trim(), requestedName: "", action: null };
+  // 与 push-generate 同一套标记：【快捷动作：名称】与带参数的【快捷动作：名称({...})】
+  // 都要认（参数允许换行）——老正则会把括号连参数当成动作名，目录匹配必然落空。
+  const match = raw.match(/【快捷动作[：:]\s*([^(（）)】\n]{1,60}?)\s*(?:[(（]([\s\S]{0,2000}?)[)）])?\s*】/);
+  if (!match) return { text: raw.trim(), requestedName: "", action: null, args: {}, marker: null };
   const requestedName = match[1].trim();
+  // 括号里的 JSON 参数写坏了就当没带——宁可少传，也不要整条动作失败。
+  // 模型爱用全角标点（中文引号/冒号/逗号），原文解析失败就按归一化后的再试一次。
+  let args = {};
+  const rawArgs = (match[2] || "").trim();
+  if (rawArgs) {
+    const candidates = [rawArgs, rawArgs.replace(/[\u201c\u201d\u201e\u201f]/g, '"').replace(/\uff1a/g, ":").replace(/\uff0c/g, ",")];
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) { args = parsed; break; }
+      } catch { /* try next */ }
+    }
+    // 排障留痕：参数写了但一个都没解析出来，日志里能看到模型到底写了什么
+    if (Object.keys(args).length === 0) {
+      console.warn(`[weixin-assistant] 快捷动作参数解析失败 name=${requestedName} raw=${rawArgs.slice(0, 200)}`);
+    }
+  }
+  const stripRe = /【快捷动作[：:]\s*[^(（）)】\n]{1,60}?\s*(?:[(（][\s\S]{0,2000}?[)）])?\s*】/g;
   const cleaned = raw
-    .replace(/【快捷动作[：:][^】\n]{1,60}】/g, "")
+    .replace(stripRe, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim() || "……";
+  // 标记在剥离后正文中的原始位置：对前缀做同一套清洗后取长度（尾部 trim 不影响
+  // 前缀）。下一轮拼上下文/拉回小手机时按这个位置原样还原，不挪到末尾。
+  const cleanedPrefix = raw.slice(0, match.index)
+    .replace(stripRe, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/^\s+/, "");
   const action = actions.find(item => String(item?.name || "") === requestedName) || null;
-  return { text: cleaned, requestedName, action };
+  return {
+    text: cleaned,
+    requestedName,
+    action,
+    args,
+    marker: { text: match[0], insertAt: Math.min(cleanedPrefix.length, cleaned.length) },
+  };
 }
 
 function compactContinuationMessages(messages) {
@@ -625,27 +694,32 @@ async function callPersonalPushGateway(env, action, body) {
   return data;
 }
 
-async function prepareWeixinShortcut(env, runtime, action, firstMessages, firstReply) {
+async function prepareWeixinShortcut(env, runtime, action, firstMessages, firstReply, args = {}) {
   const created = await callPersonalPushGateway(env, "shortcut-create", {
     actionId: action.actionId,
     actionName: action.name,
     shortcutName: action.shortcutName,
-    arguments: {},
+    arguments: args,
     resultMode: action.resultMode,
+    deliveryMode: action.deliveryMode,
     expiresInSeconds: action.expiresInSeconds,
     deferDelivery: true,
   });
   const commandId = String(created?.command?.id || "");
   if (!commandId) throw new Error("shortcut_command_id_missing");
+  const resultUrl = String(created?.resultUrl || "");
 
   if (action.resultMode !== "none") {
     try {
+    // 识图关着就不送图：送了轻则被模型忽略，重则接口直接 400 让整个第二轮
+    // 失败。图片位改放一句说明，附带文字仍照常经结果占位抵达。
+    const canSendImage = action.resultMode === "image" && runtime.promptContext?.enableVision === true;
     const messages = [
       ...compactContinuationMessages(firstMessages),
       { role: "assistant", content: firstReply },
       { role: "user", content: WEIXIN_SHORTCUT_RESULT_MARKER },
       ...(action.resultMode === "image"
-        ? [{ role: "user", content: WEIXIN_SHORTCUT_IMAGE_MARKER }]
+        ? [{ role: "user", content: canSendImage ? WEIXIN_SHORTCUT_IMAGE_MARKER : SHORTCUT_VISION_OFF_NOTE }]
         : []),
     ];
     const request = buildChatCompletionRequest(runtime.apiConfig || {}, runtime.preset || null, messages);
@@ -656,7 +730,7 @@ async function prepareWeixinShortcut(env, runtime, action, firstMessages, firstR
         actionName: action.name,
         resultMode: action.resultMode,
         resultMarker: WEIXIN_SHORTCUT_RESULT_MARKER,
-        ...(action.resultMode === "image" ? { imageMarker: WEIXIN_SHORTCUT_IMAGE_MARKER } : {}),
+        ...(canSendImage ? { imageMarker: WEIXIN_SHORTCUT_IMAGE_MARKER } : {}),
         style: "text",
       },
       notify: { title: runtime.character?.name || "小手机", url: "/" },
@@ -714,15 +788,71 @@ async function prepareWeixinShortcut(env, runtime, action, firstMessages, firstR
     }
   }
 
-  return { commandId, actionName: action.name };
+  return {
+    commandId,
+    actionName: action.name,
+    actionId: action.actionId,
+    deliveryMode: action.deliveryMode,
+    resultUrl,
+    // 邮件代发要把参数再报给站点拼进正文：命令表里的 action_args 站点看不到
+    args,
+  };
 }
 
-async function deliverWeixinShortcut(env, commandId) {
+async function deliverWeixinShortcut(env, deferred) {
+  // 邮件模式必须转投站点代发：个人云自己没有发信服务（RESEND_API_KEY 是站点的
+  // 环境变量），而网关的 shortcut-deliver 只会发 Web Push，对邮件命令直接返回
+  // 409。以前这里固定调 shortcut-deliver，所以用户配了邮件自动执行也照样弹通知。
+  if (deferred?.deliveryMode === "email") return deliverWeixinShortcutEmail(env, deferred);
   try {
-    const data = await callPersonalPushGateway(env, "shortcut-deliver", { commandId });
+    const data = await callPersonalPushGateway(env, "shortcut-deliver", { commandId: deferred.commandId });
     return data?.delivered === true
       ? { ok: true }
       : { ok: false, error: "shortcut_notification_not_delivered" };
+  } catch (err) {
+    return { ok: false, error: errorMessage(err) };
+  }
+}
+
+/** 请站点凭 site_bridge_token 代发触发邮件；命令行与结果回传仍留在个人云。 */
+async function deliverWeixinShortcutEmail(env, deferred) {
+  try {
+    if (!deferred.resultUrl) return { ok: false, error: "shortcut_result_url_missing" };
+    const configResponse = await supabaseRest(
+      env,
+      "push_server_config?id=eq.main&select=site_origin&limit=1",
+    );
+    const configRows = configResponse.ok ? await configResponse.json().catch(() => []) : [];
+    const siteOrigin = String(configRows?.[0]?.site_origin || "").trim();
+    if (!siteOrigin) return { ok: false, error: "site_origin_unknown" };
+
+    const tokenResponse = await supabaseRest(
+      env,
+      "push_bridge_config?user_id=eq.owner&select=site_bridge_token&limit=1",
+    );
+    const tokenRows = tokenResponse.ok ? await tokenResponse.json().catch(() => []) : [];
+    const siteBridgeToken = String(tokenRows?.[0]?.site_bridge_token || "");
+    // 令牌没同步上来，多半是个人云还没跑过新版 schema（site_bridge_token 是后加的列）
+    if (!siteBridgeToken) return { ok: false, error: "站点代发未启用：请到「设置 → 云服务部署」重新部署个人云" };
+
+    const response = await fetch(`${siteOrigin}/api/push/shortcut-commands/deliver-email`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: siteBridgeToken,
+        actionId: deferred.actionId,
+        actionName: deferred.actionName,
+        commandId: deferred.commandId,
+        resultUrl: deferred.resultUrl,
+        // 之前这里硬编码空对象：命令表里参数好好存着，邮件正文里却永远没有——
+        // 快捷指令从邮件取输入，等于参数在最后一步被整个过滤掉
+        arguments: deferred.args && typeof deferred.args === "object" ? deferred.args : {},
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    return response.ok && data?.ok === true
+      ? { ok: true }
+      : { ok: false, error: String(data?.error || `site_email_http_${response.status}`) };
   } catch (err) {
     return { ok: false, error: errorMessage(err) };
   }
@@ -900,7 +1030,20 @@ export function renderHistoryPromptMessages(collected) {
 
 function cloudStoredMessageToPromptMessage(runtime, message, imageAttachments = new Map()) {
   const role = message.role === "assistant" ? "assistant" : message.role === "system" ? "system" : "user";
-  const text = String(message.content || "");
+  let text = String(message.content || "");
+  // 把这一轮实际执行过的快捷动作标记按原始位置还原进上下文：模型看到的历史
+  // 与它当初的输出一致，「换一首」才换得动。只进提示词，微信正文仍是剥离后的。
+  const marker = message.shortcutMarker;
+  if (marker && typeof marker === "object" && typeof marker.text === "string" && marker.text) {
+    const at = Math.max(0, Math.min(Number(marker.insertAt) || 0, text.length));
+    text = `${text.slice(0, at)}\n${marker.text}\n${text.slice(at)}`.replace(/\n{3,}/g, "\n\n").trim();
+  } else if (message.shortcutInvocation && typeof message.shortcutInvocation === "object" && message.shortcutInvocation.name) {
+    // 旧字段兼容：v1 存量消息只有名称+参数，没有原文位置，补一条等价标记在末尾
+    const legacy = message.shortcutInvocation;
+    let argsJson = "{}";
+    try { argsJson = JSON.stringify(legacy.args ?? {}); } catch { /* keep {} */ }
+    text = `${text}\n【快捷动作：${legacy.name}${argsJson === "{}" ? "" : `(${argsJson})`}】`.trim();
+  }
   const imageDataUrl = message.externalId ? imageAttachments.get(message.externalId) : undefined;
   if (!text.trim() && !imageDataUrl) return null;
   return {
@@ -1753,7 +1896,7 @@ function makeIlinkHeaders(botToken) {
   return headers;
 }
 
-async function storeOutgoingMessage(env, runtime, externalId, content, raw, replyAnchor) {
+async function storeOutgoingMessage(env, runtime, externalId, content, raw, replyAnchor, shortcutMarker) {
   const createdAt = new Date().toISOString();
   const path = `${MESSAGE_PREFIX}/${runtime.bot.id}/${sanitizePathPart(externalId)}.json`;
   await putObject(env, path, JSON.stringify({
@@ -1773,6 +1916,10 @@ async function storeOutgoingMessage(env, runtime, externalId, content, raw, repl
       replyAfterCreatedAt: replyAnchor.createdAt,
       replySequence: replyAnchor.sequence,
     } : {}),
+    // 快捷动作标记发出即从正文剥离（微信真实用户永远收不到标记），但模型的
+    // 上下文里要保留原样标记在原始位置——否则角色下一轮看不到自己传过什么参数，
+    // 「换一首歌」会换出同一首。存原文+位置，拼提示词/拉回小手机时按位还原。
+    ...(shortcutMarker?.text ? { shortcutMarker } : {}),
   }, null, 2), "application/json");
 }
 

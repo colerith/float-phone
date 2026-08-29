@@ -173,14 +173,21 @@ export async function removeObject(config: CloudBackupConfig, path: string): Pro
 
 export type StorageObject = { name: string; size: number; updatedAt?: string };
 
-/** List objects under a prefix (e.g. "manifests/"). */
-export async function listObjects(config: CloudBackupConfig, prefix = "", limit = 100): Promise<StorageObject[]> {
+/** List objects under a prefix (e.g. "manifests/"). sort 缺省按名字升序（老行为）；
+ *  对象可能超过 limit 的调用方要自己选对排序，否则最新的对象会被截断在窗口外。 */
+export async function listObjects(
+  config: CloudBackupConfig,
+  prefix = "",
+  limit = 100,
+  sort?: { column: "name" | "created_at" | "updated_at"; order: "asc" | "desc" },
+  offset = 0,
+): Promise<StorageObject[]> {
   const creds = resolveCreds(config);
   if (!creds) throw new Error("未配置 Supabase 地址或 key。");
   const res = await withRetries(() => fetchWithTimeout(`${creds.url}/storage/v1/object/list/${CLOUD_BACKUP_BUCKET}`, {
     method: "POST",
     headers: { ...authHeaders(creds.key), "Content-Type": "application/json" },
-    body: JSON.stringify({ prefix, limit, offset: 0, sortBy: { column: "name", order: "asc" } }),
+    body: JSON.stringify({ prefix, limit, offset, sortBy: sort ?? { column: "name", order: "asc" } }),
     cache: "no-store",
   }, CONTROL_TIMEOUT_MS, "列举"));
   if (!res.ok) throw new Error(await describeError(res));

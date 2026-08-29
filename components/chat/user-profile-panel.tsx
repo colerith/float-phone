@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, type CSSProperties } from "react";
+import { useState, useEffect, useMemo, type CSSProperties } from "react";
 import CSSSchemeBar from "@/components/ui/css-scheme-picker";
 import {
     loadFollowUpConfig,
@@ -627,10 +627,39 @@ function FollowUpSettingsEditor({ onBack }: { onBack: () => void }) {
 function ApiLogViewer({ onBack }: { onBack: () => void }) {
     const [logs, setLogs] = useState<DebugInfo[]>([]);
     const [expandedId, setExpandedId] = useState<string | null>(null);
+    // 来源过滤：hiddenSources 里记录被取消勾选的来源；空集 = 全部显示
+    const [hiddenSources, setHiddenSources] = useState<Set<string>>(new Set());
 
     useEffect(() => {
         setLogs([...getApiLogs()].reverse());
     }, []);
+
+    // 从日志里提取所有来源（聊天角色名 / 记忆总结·角色名 等标签）
+    const allSources = useMemo(() => {
+        const set = new Set<string>();
+        for (const log of logs) set.add(log.characterName || "未标注来源");
+        return [...set].sort();
+    }, [logs]);
+
+    const toggleSource = (source: string) => {
+        setHiddenSources(prev => {
+            const next = new Set(prev);
+            if (next.has(source)) next.delete(source); else next.add(source);
+            return next;
+        });
+    };
+
+    // 全部勾选 = 清空隐藏集；全部取消 = 隐藏所有来源
+    const allChecked = hiddenSources.size === 0;
+    const toggleAll = () => {
+        if (allChecked) setHiddenSources(new Set(allSources));
+        else setHiddenSources(new Set());
+    };
+
+    const visibleLogs = useMemo(() => {
+        if (hiddenSources.size === 0) return logs;
+        return logs.filter(log => !hiddenSources.has(log.characterName || "未标注来源"));
+    }, [logs, hiddenSources]);
 
     const handleClear = () => {
         clearApiLogs();
@@ -651,8 +680,41 @@ function ApiLogViewer({ onBack }: { onBack: () => void }) {
                     </div>
                 ) : (
                     <>
+                        {/* 显示设置：来源过滤复选框（查看原始回复请逐条展开，或到聊天界面点消息旁的「AI 原始回复」按钮） */}
+                        <div className="menu-group">
+                            <div className="px-4 py-3 flex flex-col gap-2">
+                                <div className="flex items-center justify-between">
+                                    <span className="menu-label">来源过滤</span>
+                                    <button
+                                        type="button"
+                                        className="ui-bare-btn ts-12 font-semibold text-[var(--c-icon-active)]"
+                                        onClick={toggleAll}
+                                    >
+                                        {allChecked ? "全不选" : "全选"}
+                                    </button>
+                                </div>
+                                <div className="flex flex-wrap gap-x-3 gap-y-2">
+                                    <label className="flex items-center gap-1.5 ts-12 cursor-pointer select-none">
+                                        <input type="checkbox" checked={allChecked} onChange={toggleAll} />
+                                        <span>全部</span>
+                                    </label>
+                                    {allSources.map(src => (
+                                        <label key={src} className="flex items-center gap-1.5 ts-12 cursor-pointer select-none">
+                                            <input type="checkbox" checked={!hiddenSources.has(src)} onChange={() => toggleSource(src)} />
+                                            <span className="max-w-[140px] truncate">{src}</span>
+                                        </label>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+
+                        {visibleLogs.length === 0 ? (
+                            <div className="ui-empty">
+                                <span className="menu-desc">当前来源过滤下没有调用记录</span>
+                            </div>
+                        ) : (
                         <div className="flex flex-col gap-3">
-                            {logs.map(log => {
+                            {visibleLogs.map(log => {
                                 const isOpen = expandedId === log.id;
                                 return (
                                     <div key={log.id} className="menu-group">
@@ -678,6 +740,14 @@ function ApiLogViewer({ onBack }: { onBack: () => void }) {
                                                 </div>
                                             </div>
                                             <div className="menu-right">
+                                                <span
+                                                    className="api-log-raw-tag"
+                                                    role="button"
+                                                    tabIndex={0}
+                                                    onClick={(e) => { e.stopPropagation(); setExpandedId(isOpen ? null : log.id); }}
+                                                    onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpandedId(isOpen ? null : log.id); } }}
+                                                    title="查看这条调用的思维链原文"
+                                                >查看原始</span>
                                                 <ChevronRight
                                                     size={16}
                                                     className="ui-chevron-flip"
@@ -708,9 +778,17 @@ function ApiLogViewer({ onBack }: { onBack: () => void }) {
                                                         </div>
                                                     </div>
                                                 ))}
-                                                <div className="font-bold mt-3 mb-[6px] text-[var(--c-danger)]">
-                                                    AI 原始回复
-                                                </div>
+                                                {log.reasoning && (
+                                                    <>
+                                                        <div className="font-bold px-1 pt-3 pb-2 text-[var(--c-warning)]">
+                                                            思维链（Reasoning）
+                                                        </div>
+                                                        <div className="api-log-reasoning whitespace-pre-wrap break-all leading-[1.4]">
+                                                            {log.reasoning}
+                                                        </div>
+                                                    </>
+                                                )}
+                                                <div className="font-bold mt-3 mb-[6px] text-[var(--c-danger)]">AI 原始回复</div>
                                                 <div className="api-log-response whitespace-pre-wrap break-all leading-[1.4]">
                                                     {log.rawResponse}
                                                 </div>
@@ -720,6 +798,7 @@ function ApiLogViewer({ onBack }: { onBack: () => void }) {
                                 );
                             })}
                         </div>
+                        )}
 
                         {/* Clear button */}
                         <div className="menu-group mt-4">

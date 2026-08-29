@@ -3,7 +3,7 @@
 // 独家特调 · 共享 UI 小件：材料卡 / 种类图标 / 详情字段渲染。
 // 酒柜（本地）与酒单/大厅（官网）两边共用，保持一套视觉语言。
 
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
     BookOpen,
     CircleUserRound,
@@ -121,15 +121,23 @@ export function MatCard({
     stats?: string;
     onClick: () => void;
 }) {
+    // 封面加载不出来（云端遗留的旧值、桶里的对象没了）就当没有封面：
+    // 退回自动缩样或占位图标。不兜这一下的话，卡面会是一块什么都没有的空白。
+    const [coverBroken, setCoverBroken] = useState(false);
+    useEffect(() => { setCoverBroken(false); }, [cover]);
+    const shownCover = cover && !coverBroken ? cover : "";
     // 卡型只看种类，不看有没有配图——否则同一类里配了图的高、没配图的矮，
     // 双列瀑布会参差。视觉类（角色卡/小票/装饰/尾调）一律海报式（缺图时用
     // 同尺寸的占位面），纯文本类（基底/文风/杯型/苦精）一律单列横条。
+    // 小票/尾调的静态封面就是渲染缩样（收起状态原样拍的那张）：卡片高度随图走、
+    // 不裁不放大，和酒柜实时缩样长一个样。角色卡等配图封面仍走固定比例海报裁满。
+    const flowCover = Boolean(shownCover) && (kind === "ticket" || kind === "encore");
     if (mixKindHasCover(kind)) {
         return (
-            <div className="mix-mat-card" data-kind={kind} data-poster="true" data-live={!cover && preview ? "true" : undefined} onClick={onClick}>
-                {cover ? (
+            <div className="mix-mat-card" data-kind={kind} data-poster="true" data-live={!shownCover && preview ? "true" : undefined} data-flow={flowCover ? "true" : undefined} onClick={onClick}>
+                {shownCover ? (
                     // eslint-disable-next-line @next/next/no-img-element
-                    <img className="mix-mat-cover" src={cover} alt={name} />
+                    <img className="mix-mat-cover" src={shownCover} alt={name} onError={() => setCoverBroken(true)} />
                 ) : preview ? (
                     // 自动封面走文档流：卡片高度=缩样实际高度，不垫占位纹（透明缩样底下不透图标）
                     <div className="mix-poster-flow" aria-hidden="true">{preview}</div>

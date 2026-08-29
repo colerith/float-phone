@@ -2209,6 +2209,16 @@
     );
 }
 
+/* 缩样卡（实时缩样 data-live / 渲染缩略图封面 data-flow）：缩样本身就是内容，
+   文字压上去会挡住看的东西——文案区改走文档流，落在缩样下面单独一段。
+   角色卡等配图海报仍用压图 + 渐变纱的经典样式 */
+.mix-mat-card[data-poster="true"][data-live="true"] .mix-poster-veil,
+.mix-mat-card[data-poster="true"][data-flow="true"] .mix-poster-veil {
+    position: static;
+    padding: 9px 11px 11px;
+    background: none;
+}
+
 .mix-poster-name {
     font-size: 14.5px;
     font-weight: 700;
@@ -2413,10 +2423,21 @@
     pointer-events: none;
 }
 
-/* 有缩样的海报卡：放开固定比例，高度由缩样决定；给个下限护住底部文案区 */
-.mix-mat-card[data-poster="true"][data-live="true"] {
+/* 有缩样的海报卡：放开固定比例，高度由缩样决定；给个下限护住底部文案区。
+   data-flow 是小票/尾调的静态封面（渲染缩样拍成的图）：同样随内容走 */
+.mix-mat-card[data-poster="true"][data-live="true"],
+.mix-mat-card[data-poster="true"][data-flow="true"] {
     aspect-ratio: auto;
     min-height: 96px;
+}
+
+/* 缩样封面回到文档流按原比例摆：固定海报框 + object-fit: cover 会把
+   收起状态的矮小票放大裁剪成一条，和酒柜的实时缩样对不上 */
+.mix-mat-card[data-poster="true"][data-flow="true"] .mix-mat-cover {
+    position: static;
+    height: auto;
+    aspect-ratio: auto;
+    object-fit: unset;
 }
 
 .mix-poster-blank {
